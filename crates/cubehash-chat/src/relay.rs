@@ -2,31 +2,44 @@ use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
-use axum::response::{Html, IntoResponse};
-use axum::routing::get;
-use axum::{Json, Router};
 use cubehash_core::PayloadMode;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, RwLock};
+use tokio_tungstenite::accept_async;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::protocol::{RelayFrame, RelayTrafficEvent};
+use crate::keystore::DeviceIdentity;
+use crate::protocol::{
+    auth_challenge_sign_bytes, epoch_hop_sign_bytes, pair_offer_sign_bytes, PeerIdentity,
+    RelayFrame, RelayTrafficEvent,
+};
+use crate::tls::{BuiltRelayTls, RelayTlsConfig};
 
 const MAX_TELEMETRY_HISTORY: usize = 100;
+const AUTH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Shared state for the zero-knowledge blind relay server.
+struct ClientEntry {
+    conn_id: u64,
+    ed25519_pub: [u8; 32],
+    tx: mpsc::UnboundedSender<WsMessage>,
+}
+
+/// Shared state for the zero-knowledge TLS blind relay server.
 ///
-/// Holds ONLY active WebSocket routing handles and sanitized opaque wire metadata.
-/// Never stores keys, `MotherCube` material, or plaintext.
+/// Holds ONLY active WebSocket routing handles, authenticated Ed25519 public identity pins,
+/// and sanitized opaque wire metadata. Never stores encryption keys, `MotherCube` material, or plaintext.
 #[derive(Clone, Default)]
 pub struct BlindRelayState {
-    clients: Arc<RwLock<HashMap<String, mpsc::UnboundedSender<Message>>>>,
+    clients: Arc<RwLock<HashMap<String, ClientEntry>>>,
+    pinned_identities: Arc<RwLock<HashMap<String, [u8; 32]>>>,
     telemetry: Arc<RwLock<VecDeque<RelayTrafficEvent>>>,
     seq_counter: Arc<AtomicU64>,
+    conn_counter: Arc<AtomicU64>,
 }
 
 #[derive(Serialize)]
@@ -34,6 +47,16 @@ pub struct TelemetrySnapshot {
     pub online_peers: Vec<String>,
     pub total_routed_frames: u64,
     pub recent_frames: Vec<RelayTrafficEvent>,
+}
+
+/// Handle and TLS metadata returned when starting the blind relay server.
+pub struct StartedRelay {
+    pub addr: SocketAddr,
+    pub is_tls: bool,
+    pub tls_cert_sha256_hex: Option<String>,
+    pub tls_cert_pem: Option<String>,
+    pub state: BlindRelayState,
+    pub handle: tokio::task::JoinHandle<()>,
 }
 
 impl BlindRelayState {
@@ -62,34 +85,48 @@ impl BlindRelayState {
         guard.push_back(event);
     }
 
-    async fn broadcast_peer_list(&self) {
+    async fn current_peer_identities(&self) -> Vec<PeerIdentity> {
         let clients = self.clients.read().await;
-        let mut online_peers: Vec<String> = clients.keys().cloned().collect();
-        online_peers.sort();
-        let payload = match serde_json::to_string(&RelayFrame::PeerList { online_peers }) {
+        let mut peers: Vec<PeerIdentity> = clients
+            .iter()
+            .map(|(cid, entry)| PeerIdentity {
+                client_id: cid.clone(),
+                ed25519_pub: entry.ed25519_pub,
+            })
+            .collect();
+        peers.sort_by(|a, b| a.client_id.cmp(&b.client_id));
+        peers
+    }
+
+    async fn broadcast_peer_list(&self) {
+        let peers = self.current_peer_identities().await;
+        let payload = match serde_json::to_string(&RelayFrame::PeerList {
+            online_peers: peers,
+        }) {
             Ok(p) => p,
             Err(_) => return,
         };
-        for tx in clients.values() {
-            let _ = tx.send(Message::Text(payload.clone().into()));
+        let clients = self.clients.read().await;
+        for entry in clients.values() {
+            let _ = entry.tx.send(WsMessage::Text(payload.clone().into()));
         }
     }
 
     async fn forward_to(&self, from: &str, to: &str, raw_json: String) {
-        let target = self.clients.read().await.get(to).cloned();
+        let target = self.clients.read().await.get(to).map(|e| e.tx.clone());
         match target {
             Some(tx) => {
-                let _ = tx.send(Message::Text(raw_json.into()));
+                let _ = tx.send(WsMessage::Text(raw_json.into()));
             }
             None => {
-                if let Some(sender_tx) = self.clients.read().await.get(from).cloned() {
+                if let Some(sender) = self.clients.read().await.get(from).map(|e| e.tx.clone()) {
                     let err = RelayFrame::RelayError {
                         code: "peer_offline".to_string(),
                         detail: format!("recipient '{to}' is not connected"),
                         peer: Some(to.to_string()),
                     };
                     if let Ok(txt) = serde_json::to_string(&err) {
-                        let _ = sender_tx.send(Message::Text(txt.into()));
+                        let _ = sender.send(WsMessage::Text(txt.into()));
                     }
                 }
             }
@@ -97,44 +134,76 @@ impl BlindRelayState {
     }
 }
 
-/// Builds the Axum router for the blind WebSocket relay + zero-knowledge traffic inspector.
-pub fn build_relay_router(state: BlindRelayState) -> Router {
-    Router::new()
-        .route("/", get(inspector_page))
-        .route("/health", get(|| async { "ok" }))
-        .route("/api/telemetry", get(telemetry_handler))
-        .route("/ws", get(ws_handler))
-        .with_state(state)
-}
-
-/// Starts the blind WebSocket relay server on `addr`, returning the bound `SocketAddr`.
+/// Starts the zero-knowledge WebSocket relay server on `addr` using the supplied TLS config.
 pub async fn start_relay_server(
     addr: SocketAddr,
-) -> std::io::Result<(SocketAddr, BlindRelayState, tokio::task::JoinHandle<()>)> {
+    tls_config: RelayTlsConfig,
+) -> std::io::Result<StartedRelay> {
+    let built_tls = BuiltRelayTls::build(tls_config)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
     let state = BlindRelayState::new();
-    let app = build_relay_router(state.clone());
+    let is_tls = built_tls.acceptor.is_some();
+    let cert_sha256_hex = built_tls.cert_sha256.map(hex::encode);
+    let cert_pem = built_tls.cert_pem.clone();
+    let acceptor = built_tls.acceptor.clone();
+    let state_clone = state.clone();
+
     let handle = tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        loop {
+            let Ok((tcp, _peer_addr)) = listener.accept().await else {
+                continue;
+            };
+            let state_task = state_clone.clone();
+            let acceptor_task = acceptor.clone();
+            tokio::spawn(async move {
+                match acceptor_task {
+                    Some(tls) => {
+                        if let Ok(tls_stream) = tls.accept(tcp).await {
+                            if let Ok(ws_stream) = accept_async(tls_stream).await {
+                                handle_socket(ws_stream, state_task).await;
+                            }
+                        }
+                    }
+                    None => {
+                        if let Ok(ws_stream) = accept_async(tcp).await {
+                            handle_socket(ws_stream, state_task).await;
+                        }
+                    }
+                }
+            });
+        }
     });
-    Ok((local_addr, state, handle))
+
+    Ok(StartedRelay {
+        addr: local_addr,
+        is_tls,
+        tls_cert_sha256_hex: cert_sha256_hex,
+        tls_cert_pem: cert_pem,
+        state,
+        handle,
+    })
 }
 
-async fn telemetry_handler(State(state): State<BlindRelayState>) -> Json<TelemetrySnapshot> {
-    Json(state.snapshot().await)
+async fn send_error(tx: &mpsc::UnboundedSender<WsMessage>, code: &str, detail: &str) {
+    let err = RelayFrame::RelayError {
+        code: code.to_string(),
+        detail: detail.to_string(),
+        peer: None,
+    };
+    if let Ok(txt) = serde_json::to_string(&err) {
+        let _ = tx.send(WsMessage::Text(txt.into()));
+    }
 }
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<BlindRelayState>,
-) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_socket(socket, state))
-}
-
-async fn handle_socket(socket: WebSocket, state: BlindRelayState) {
-    let (mut ws_tx, mut ws_rx) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+async fn handle_socket<S>(ws_stream: tokio_tungstenite::WebSocketStream<S>, state: BlindRelayState)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let conn_id = state.conn_counter.fetch_add(1, Ordering::Relaxed) + 1;
+    let (mut ws_tx, mut ws_rx) = ws_stream.split();
+    let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
 
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -144,44 +213,190 @@ async fn handle_socket(socket: WebSocket, state: BlindRelayState) {
         }
     });
 
-    let mut client_id: Option<String> = None;
+    // 1. Issue fresh random Ed25519 challenge immediately upon connection.
+    let mut challenge_nonce = [0u8; 32];
+    if getrandom::getrandom(&mut challenge_nonce).is_err() {
+        writer_task.abort();
+        return;
+    }
+    let challenge = RelayFrame::AuthChallenge {
+        nonce: challenge_nonce,
+    };
+    if let Ok(txt) = serde_json::to_string(&challenge) {
+        if tx.send(WsMessage::Text(txt.into())).is_err() {
+            writer_task.abort();
+            return;
+        }
+    }
 
-    while let Some(Ok(msg)) = ws_rx.next().await {
-        let Message::Text(text) = msg else {
+    // 2. Require authenticated RegisterAuth before permitting any routing.
+    let mut authed: Option<(String, [u8; 32])> = None;
+    let auth_deadline = tokio::time::Instant::now() + AUTH_HANDSHAKE_TIMEOUT;
+
+    loop {
+        let remaining = auth_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            send_error(&tx, "auth_timeout", "Ed25519 registration timed out").await;
+            break;
+        }
+        let Ok(next_item) = tokio::time::timeout(remaining, ws_rx.next()).await else {
+            send_error(&tx, "auth_timeout", "Ed25519 registration timed out").await;
+            break;
+        };
+        let Some(Ok(msg)) = next_item else {
+            break;
+        };
+        let WsMessage::Text(text) = msg else {
             continue;
         };
         let Ok(frame) = serde_json::from_str::<RelayFrame>(&text) else {
             continue;
         };
 
-        match &frame {
-            RelayFrame::Register { client_id: cid } => {
-                let clean_id = cid.trim().to_string();
-                if clean_id.is_empty() {
-                    continue;
+        match frame {
+            RelayFrame::RegisterAuth {
+                client_id,
+                ed25519_pub,
+                signature,
+            } => {
+                let clean_id = client_id.trim().to_string();
+                if clean_id.is_empty() || clean_id.len() > 64 {
+                    send_error(&tx, "invalid_id", "client_id must be 1..=64 chars").await;
+                    break;
                 }
-                {
-                    let mut guard = state.clients.write().await;
-                    guard.insert(clean_id.clone(), tx.clone());
+                let sign_msg = auth_challenge_sign_bytes(&challenge_nonce, &clean_id);
+                if !DeviceIdentity::verify_signature(&ed25519_pub, &sign_msg, &signature) {
+                    send_error(&tx, "auth_failed", "invalid Ed25519 challenge signature").await;
+                    break;
                 }
-                client_id = Some(clean_id.clone());
 
-                let mut peers: Vec<String> = state.clients.read().await.keys().cloned().collect();
-                peers.sort();
+                // Check identity pin to block offline/online impersonation of an existing client_id.
+                {
+                    let mut pins = state.pinned_identities.write().await;
+                    if let Some(existing_pub) = pins.get(&clean_id) {
+                        if existing_pub != &ed25519_pub {
+                            send_error(
+                                &tx,
+                                "identity_mismatch",
+                                "client_id is pinned to a different Ed25519 key",
+                            )
+                            .await;
+                            break;
+                        }
+                    } else {
+                        pins.insert(clean_id.clone(), ed25519_pub);
+                    }
+                }
+
+                // Refuse hijacking an active session with the same client_id.
+                {
+                    let mut clients = state.clients.write().await;
+                    if clients.contains_key(&clean_id) {
+                        send_error(&tx, "id_in_use", "client_id is already active on relay").await;
+                        break;
+                    }
+                    clients.insert(
+                        clean_id.clone(),
+                        ClientEntry {
+                            conn_id,
+                            ed25519_pub,
+                            tx: tx.clone(),
+                        },
+                    );
+                }
+
+                authed = Some((clean_id.clone(), ed25519_pub));
+                let peers = state.current_peer_identities().await;
                 let reg = RelayFrame::Registered {
                     client_id: clean_id,
                     online_peers: peers,
                 };
                 if let Ok(txt) = serde_json::to_string(&reg) {
-                    let _ = tx.send(Message::Text(txt.into()));
+                    let _ = tx.send(WsMessage::Text(txt.into()));
                 }
                 state.broadcast_peer_list().await;
+                break;
             }
-            RelayFrame::PairOffer { from, to, .. } => {
+            _ => {
+                send_error(
+                    &tx,
+                    "unauthenticated",
+                    "complete RegisterAuth before sending frames",
+                )
+                .await;
+            }
+        }
+    }
+
+    let Some((authed_id, authed_pub)) = authed else {
+        // Allow error frame to flush before cancelling writer task.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        writer_task.abort();
+        return;
+    };
+
+    // 3. Authenticated frame forwarding loop (enforces sender ownership on every frame).
+    while let Some(Ok(msg)) = ws_rx.next().await {
+        let WsMessage::Text(text) = msg else {
+            continue;
+        };
+        let Ok(frame) = serde_json::from_str::<RelayFrame>(&text) else {
+            continue;
+        };
+
+        let claimed_from = match &frame {
+            RelayFrame::PairOffer { from, .. }
+            | RelayFrame::PairAccept { from, .. }
+            | RelayFrame::EncryptedPacket { from, .. }
+            | RelayFrame::AckFrame { from, .. }
+            | RelayFrame::EpochHopNotice { from, .. } => Some(from.as_str()),
+            _ => None,
+        };
+
+        if let Some(sender) = claimed_from {
+            if sender != authed_id {
+                send_error(
+                    &tx,
+                    "spoofed_sender",
+                    "frame 'from' does not match authenticated Ed25519 identity",
+                )
+                .await;
+                continue;
+            }
+        }
+
+        match &frame {
+            RelayFrame::PairOffer {
+                from,
+                to,
+                pair_id,
+                eph_pub,
+                init_rx_dh_pub,
+                sender_ed25519_pub,
+                profile,
+                has_psk,
+                signature,
+            } => {
+                let sign_msg = pair_offer_sign_bytes(
+                    from,
+                    to,
+                    pair_id,
+                    eph_pub,
+                    init_rx_dh_pub,
+                    sender_ed25519_pub,
+                    *profile,
+                    *has_psk,
+                );
+                if sender_ed25519_pub != &authed_pub
+                    || !DeviceIdentity::verify_signature(sender_ed25519_pub, &sign_msg, signature)
+                {
+                    send_error(&tx, "bad_signature", "PairOffer failed Ed25519 verification").await;
+                    continue;
+                }
                 state
                     .record_event(RelayTrafficEvent {
                         seq: 0,
-                        frame_type: "PairOffer (X25519)".to_string(),
+                        frame_type: "PairOffer (Ed25519+X25519)".to_string(),
                         from: from.clone(),
                         to: to.clone(),
                         wire_fingerprint_hex: None,
@@ -192,11 +407,20 @@ async fn handle_socket(socket: WebSocket, state: BlindRelayState) {
                     .await;
                 state.forward_to(from, to, text.to_string()).await;
             }
-            RelayFrame::PairAccept { from, to, .. } => {
+            RelayFrame::PairAccept {
+                from,
+                to,
+                sender_ed25519_pub,
+                ..
+            } => {
+                if sender_ed25519_pub != &authed_pub {
+                    send_error(&tx, "bad_signature", "PairAccept Ed25519 key mismatch").await;
+                    continue;
+                }
                 state
                     .record_event(RelayTrafficEvent {
                         seq: 0,
-                        frame_type: "PairAccept (X25519)".to_string(),
+                        frame_type: "PairAccept (Ed25519+X25519)".to_string(),
                         from: from.clone(),
                         to: to.clone(),
                         wire_fingerprint_hex: None,
@@ -247,11 +471,36 @@ async fn handle_socket(socket: WebSocket, state: BlindRelayState) {
                     .await;
                 state.forward_to(from, to, text.to_string()).await;
             }
-            RelayFrame::EpochHopNotice { from, to, .. } => {
+            RelayFrame::EpochHopNotice {
+                from,
+                to,
+                new_epoch,
+                epoch_eph_pub,
+                sender_ed25519_pub,
+                signature,
+            } => {
+                let sign_msg = epoch_hop_sign_bytes(
+                    from,
+                    to,
+                    *new_epoch,
+                    epoch_eph_pub,
+                    sender_ed25519_pub,
+                );
+                if sender_ed25519_pub != &authed_pub
+                    || !DeviceIdentity::verify_signature(sender_ed25519_pub, &sign_msg, signature)
+                {
+                    send_error(
+                        &tx,
+                        "bad_signature",
+                        "EpochHopNotice failed Ed25519 verification",
+                    )
+                    .await;
+                    continue;
+                }
                 state
                     .record_event(RelayTrafficEvent {
                         seq: 0,
-                        frame_type: "EpochHopNotice".to_string(),
+                        frame_type: "EpochHopNotice (Signed+DH)".to_string(),
                         from: from.clone(),
                         to: to.clone(),
                         wire_fingerprint_hex: None,
@@ -262,65 +511,20 @@ async fn handle_socket(socket: WebSocket, state: BlindRelayState) {
                     .await;
                 state.forward_to(from, to, text.to_string()).await;
             }
-            RelayFrame::Registered { .. }
+            RelayFrame::AuthChallenge { .. }
+            | RelayFrame::RegisterAuth { .. }
+            | RelayFrame::Registered { .. }
             | RelayFrame::PeerList { .. }
             | RelayFrame::RelayError { .. } => {}
         }
     }
 
-    if let Some(cid) = client_id {
-        state.clients.write().await.remove(&cid);
-        state.broadcast_peer_list().await;
+    {
+        let mut guard = state.clients.write().await;
+        if guard.get(&authed_id).is_some_and(|e| e.conn_id == conn_id) {
+            guard.remove(&authed_id);
+        }
     }
+    state.broadcast_peer_list().await;
     writer_task.abort();
 }
-
-async fn inspector_page() -> Html<&'static str> {
-    Html(RELAY_INSPECTOR_HTML)
-}
-
-const RELAY_INSPECTOR_HTML: &str = r#"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>CubeHash Blind Relay Inspector</title>
-<style>
-  body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #0b1020; color: #e2e8f0; margin: 0; padding: 24px; }
-  .card { background: #131b31; border: 1px solid #243154; border-radius: 12px; padding: 18px; margin-bottom: 18px; }
-  h1 { margin: 0 0 8px; font-size: 20px; color: #38bdf8; }
-  .badge { display: inline-block; background: #0f3a2e; color: #34d399; padding: 4px 10px; border-radius: 999px; font-size: 12px; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #243154; }
-  th { color: #94a3b8; }
-</style>
-</head>
-<body>
-  <div class="card">
-    <h1>CubeHash Zero-Knowledge Blind Relay</h1>
-    <span class="badge">Zero Keys • Zero Plaintext • Opaque WireCube Routing Only</span>
-    <p id="peers" style="margin-top:12px;color:#cbd5e1;">Loading peers...</p>
-  </div>
-  <div class="card">
-    <h2 style="margin-top:0;font-size:15px;color:#93c5fd;">Recent Routed Wire Frames</h2>
-    <table>
-      <thead><tr><th>#</th><th>Type</th><th>From</th><th>To</th><th>WireCube Fingerprint</th><th>Base/Total B</th><th>CT B</th></tr></thead>
-      <tbody id="rows"></tbody>
-    </table>
-  </div>
-<script>
-async function refresh() {
-  const res = await fetch('/api/telemetry');
-  const data = await res.json();
-  document.getElementById('peers').textContent = 'Online peers (' + data.online_peers.length + '): ' + (data.online_peers.join(', ') || 'none') + ' | Total frames: ' + data.total_routed_frames;
-  const tbody = document.getElementById('rows');
-  tbody.innerHTML = data.recent_frames.slice().reverse().map(f =>
-    `<tr><td>${f.seq}</td><td>${f.frame_type}</td><td>${f.from}</td><td>${f.to}</td><td>${f.wire_fingerprint_hex || '-'}</td><td>${f.wire_base_bytes ? f.wire_base_bytes + '/' + f.wire_total_bytes : '-'}</td><td>${f.ciphertext_bytes ?? '-'}</td></tr>`
-  ).join('');
-}
-refresh();
-setInterval(refresh, 1000);
-</script>
-</body>
-</html>
-"#;

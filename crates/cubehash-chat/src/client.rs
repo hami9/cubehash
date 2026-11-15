@@ -4,24 +4,31 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cubehash_core::{
-    HardwareProvider, HoneyProfile, MeshAuditStats, OsBoundHardwareProvider, PayloadMode,
-    ReceiveOutcome, UniqueWireCube, WirePacket,
+    HardwareProvider, HoneyProfile, MeshAuditStats, PayloadMode, ReceiveOutcome, UniqueWireCube,
+    WirePacket,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
-use tokio_tungstenite::connect_async;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::{client_async, WebSocketStream};
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
+use crate::keystore::DeviceIdentity;
 use crate::protocol::{
-    provision_duplex_from_ecdh, ChatMeshProfile, PairTranscriptParams, RelayFrame,
+    auth_challenge_sign_bytes, decode_padded_chat_payload, encode_padded_chat_payload,
+    epoch_hop_sign_bytes, pair_accept_sign_bytes, pair_offer_sign_bytes,
+    provision_duplex_from_ecdh, ChatMeshProfile, PairTranscriptParams, PeerIdentity, RelayFrame,
 };
+use crate::tls::{parse_ws_url, ClientTlsConfig};
 
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECT_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A single message entry displayed in the client chat log.
+/// A single message entry displayed in the CLI chat log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRecord {
     pub msg_id: String,
@@ -34,10 +41,11 @@ pub struct ChatRecord {
     pub wire_bytes: usize,
 }
 
-/// Public snapshot of a paired peer session for CLI and Web UI inspection.
+/// Public snapshot of a paired peer session for CLI inspection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerSummary {
     pub peer_id: String,
+    pub peer_ed25519_hex: String,
     pub safety_fingerprint: String,
     pub profile: ChatMeshProfile,
     pub tx_stats: MeshAuditStats,
@@ -45,20 +53,22 @@ pub struct PeerSummary {
     pub messages: Vec<ChatRecord>,
 }
 
-/// Real-time events broadcast to the Terminal CLI and Local Web UI.
+/// Real-time events broadcast to the terminal CLI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum ChatUiEvent {
     PeersUpdated {
-        online_peers: Vec<String>,
+        online_peers: Vec<PeerIdentity>,
     },
     Paired {
         peer_id: String,
+        peer_ed25519_hex: String,
         safety_fingerprint: String,
         profile: ChatMeshProfile,
     },
     IncomingPairRequest {
         from: String,
+        from_ed25519_hex: String,
         pair_id: String,
         profile: ChatMeshProfile,
         has_psk: bool,
@@ -87,10 +97,15 @@ pub enum ChatUiEvent {
     },
 }
 
+#[derive(Zeroize, ZeroizeOnDrop)]
 struct PendingPairOut {
     peer_id: String,
-    secret: StaticSecret,
-    pub_bytes: [u8; 32],
+    #[zeroize(skip)]
+    eph_secret: StaticSecret,
+    eph_pub: [u8; 32],
+    init_rx_dh_secret: [u8; 32],
+    init_rx_dh_pub: [u8; 32],
+    #[zeroize(skip)]
     profile: ChatMeshProfile,
     psk: String,
 }
@@ -99,6 +114,8 @@ struct IncomingPairOffer {
     from: String,
     pair_id: String,
     eph_pub: [u8; 32],
+    init_rx_dh_pub: [u8; 32],
+    sender_ed25519_pub: [u8; 32],
     profile: ChatMeshProfile,
     #[allow(dead_code)]
     has_psk: bool,
@@ -106,13 +123,14 @@ struct IncomingPairOffer {
 
 struct PeerChatSession {
     session: cubehash_core::DuplexCubeSession,
+    peer_ed25519_pub: [u8; 32],
     safety_fingerprint: String,
     profile: ChatMeshProfile,
     messages: Vec<ChatRecord>,
 }
 
 struct NodeInner {
-    online_peers: Vec<String>,
+    online_peers: Vec<PeerIdentity>,
     pending_offers_out: HashMap<String, PendingPairOut>,
     pending_offers_in: HashMap<String, IncomingPairOffer>,
     preset_psks: HashMap<String, String>,
@@ -135,11 +153,15 @@ impl NodeInner {
     }
 }
 
-/// Hardware-bound CubeHash chat client connected to a blind WebSocket relay.
+/// Hardware-bound, Ed25519-authenticated CubeHash chat client connected over TLS (`wss://`)
+/// to a blind WebSocket relay.
 #[derive(Clone)]
 pub struct ChatNode {
+    identity: Arc<Mutex<DeviceIdentity>>,
     client_id: String,
-    hw: Arc<OsBoundHardwareProvider>,
+    device_hw_id: [u8; 16],
+    ed25519_pub: [u8; 32],
+    backend_label: String,
     inner: Arc<RwLock<NodeInner>>,
     ws_out: mpsc::UnboundedSender<RelayFrame>,
     events_tx: broadcast::Sender<ChatUiEvent>,
@@ -148,82 +170,189 @@ pub struct ChatNode {
 }
 
 impl ChatNode {
-    /// Connects to the blind relay at `relay_ws_url` and registers `client_id`.
-    pub async fn connect(
-        client_id: impl Into<String>,
+    /// Connects cleanly to a TLS (`wss://`) or opt-in plain (`ws://`) blind relay using
+    /// an Ed25519 hardware-bound `DeviceIdentity` and completes challenge-response authentication.
+    pub async fn connect_with_config(
+        identity: DeviceIdentity,
         relay_ws_url: &str,
-        device_secret: [u8; 32],
+        tls_config: ClientTlsConfig,
+        allow_insecure_ws: bool,
     ) -> Result<Self, String> {
-        let client_id = client_id.into();
-        let hw = Arc::new(OsBoundHardwareProvider::from_host_and_secret(
-            &device_secret,
-            client_id.as_bytes(),
-        ));
+        let parsed = parse_ws_url(relay_ws_url)?;
+        if !parsed.is_tls && !allow_insecure_ws {
+            return Err(
+                "refusing unencrypted ws:// relay connection without --insecure-ws; use wss://"
+                    .to_string(),
+            );
+        }
 
-        let (ws_stream, _) = connect_async(relay_ws_url)
+        let client_id = identity.client_id().to_string();
+        let device_hw_id = identity.hardware_provider().device_hw_id();
+        let ed25519_pub = identity.ed25519_pub();
+        let backend_label = identity.backend_label().to_string();
+        let identity_arc = Arc::new(Mutex::new(identity));
+
+        let tcp = TcpStream::connect(&parsed.tcp_addr)
             .await
-            .map_err(|e| format!("failed to connect to relay {relay_ws_url}: {e}"))?;
-        let (mut ws_sink, mut ws_rx) = ws_stream.split();
+            .map_err(|e| format!("failed to connect TCP to {}: {e}", parsed.tcp_addr))?;
 
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<RelayFrame>();
+        let (out_tx, out_rx) = mpsc::unbounded_channel::<RelayFrame>();
         let (events_tx, _) = broadcast::channel(128);
         let inner = Arc::new(RwLock::new(NodeInner::new()));
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
 
-        let reg = RelayFrame::Register {
-            client_id: client_id.clone(),
+        let ws_task = if parsed.is_tls {
+            let connector = tls_config.build_connector()?;
+            let tls_stream = connector
+                .connect(parsed.server_name, tcp)
+                .await
+                .map_err(|e| format!("TLS handshake failed with {}: {e}", parsed.tcp_addr))?;
+            let (ws_stream, _) = client_async(&parsed.full_url, tls_stream)
+                .await
+                .map_err(|e| format!("WebSocket upgrade failed on {}: {e}", parsed.full_url))?;
+            tokio::spawn(Self::drive_ws(
+                ws_stream,
+                client_id.clone(),
+                Arc::clone(&identity_arc),
+                Arc::clone(&inner),
+                out_tx.clone(),
+                out_rx,
+                events_tx.clone(),
+                ready_tx,
+            ))
+        } else {
+            let (ws_stream, _) = client_async(&parsed.full_url, tcp)
+                .await
+                .map_err(|e| format!("WebSocket upgrade failed on {}: {e}", parsed.full_url))?;
+            tokio::spawn(Self::drive_ws(
+                ws_stream,
+                client_id.clone(),
+                Arc::clone(&identity_arc),
+                Arc::clone(&inner),
+                out_tx.clone(),
+                out_rx,
+                events_tx.clone(),
+                ready_tx,
+            ))
         };
-        let reg_txt = serde_json::to_string(&reg).map_err(|e| e.to_string())?;
-        ws_sink
-            .send(WsMessage::Text(reg_txt.into()))
-            .await
-            .map_err(|e| format!("failed to register on relay: {e}"))?;
 
-        let inner_clone = Arc::clone(&inner);
-        let hw_clone = Arc::clone(&hw);
-        let out_tx_clone = out_tx.clone();
-        let events_clone = events_tx.clone();
-        let cid_clone = client_id.clone();
+        match tokio::time::timeout(CONNECT_AUTH_TIMEOUT, ready_rx).await {
+            Ok(Ok(Ok(()))) => Ok(Self {
+                identity: identity_arc,
+                client_id,
+                device_hw_id,
+                ed25519_pub,
+                backend_label,
+                inner,
+                ws_out: out_tx,
+                events_tx,
+                id_counter: Arc::new(AtomicU64::new(1)),
+                ws_task: Arc::new(ws_task),
+            }),
+            Ok(Ok(Err(e))) => {
+                ws_task.abort();
+                Err(e)
+            }
+            _ => {
+                ws_task.abort();
+                Err("relay Ed25519 authentication handshake timed out".to_string())
+            }
+        }
+    }
 
-        let ws_task = tokio::spawn(async move {
-            let writer = tokio::spawn(async move {
-                while let Some(frame) = out_rx.recv().await {
-                    if let Ok(txt) = serde_json::to_string(&frame) {
-                        if ws_sink.send(WsMessage::Text(txt.into())).await.is_err() {
-                            break;
-                        }
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_ws<S>(
+        ws_stream: WebSocketStream<S>,
+        self_id: String,
+        identity: Arc<Mutex<DeviceIdentity>>,
+        inner: Arc<RwLock<NodeInner>>,
+        out_tx: mpsc::UnboundedSender<RelayFrame>,
+        mut out_rx: mpsc::UnboundedReceiver<RelayFrame>,
+        events_tx: broadcast::Sender<ChatUiEvent>,
+        ready_tx: oneshot::Sender<Result<(), String>>,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (mut ws_sink, mut ws_rx) = ws_stream.split();
+        let writer = tokio::spawn(async move {
+            while let Some(frame) = out_rx.recv().await {
+                if let Ok(txt) = serde_json::to_string(&frame) {
+                    if ws_sink.send(WsMessage::Text(txt.into())).await.is_err() {
+                        break;
                     }
                 }
-            });
-
-            while let Some(Ok(msg)) = ws_rx.next().await {
-                let WsMessage::Text(txt) = msg else {
-                    continue;
-                };
-                let Ok(frame) = serde_json::from_str::<RelayFrame>(&txt) else {
-                    continue;
-                };
-                Self::handle_relay_frame(
-                    &cid_clone,
-                    &hw_clone,
-                    &inner_clone,
-                    &out_tx_clone,
-                    &events_clone,
-                    frame,
-                )
-                .await;
             }
-            writer.abort();
         });
 
-        Ok(Self {
-            client_id,
-            hw,
-            inner,
-            ws_out: out_tx,
-            events_tx,
-            id_counter: Arc::new(AtomicU64::new(1)),
-            ws_task: Arc::new(ws_task),
-        })
+        let mut ready_opt = Some(ready_tx);
+
+        while let Some(Ok(msg)) = ws_rx.next().await {
+            let WsMessage::Text(txt) = msg else {
+                continue;
+            };
+            let Ok(frame) = serde_json::from_str::<RelayFrame>(&txt) else {
+                continue;
+            };
+
+            match frame {
+                RelayFrame::AuthChallenge { nonce } => {
+                    let sign_msg = auth_challenge_sign_bytes(&nonce, &self_id);
+                    let id_guard = identity.lock().await;
+                    let sig = id_guard.sign(&sign_msg);
+                    let ed25519_pub = id_guard.ed25519_pub();
+                    drop(id_guard);
+                    let _ = out_tx.send(RelayFrame::RegisterAuth {
+                        client_id: self_id.clone(),
+                        ed25519_pub,
+                        signature: sig,
+                    });
+                }
+                RelayFrame::Registered { online_peers, .. } => {
+                    let filtered: Vec<PeerIdentity> = online_peers
+                        .into_iter()
+                        .filter(|p| p.client_id != self_id)
+                        .collect();
+                    inner.write().await.online_peers = filtered.clone();
+                    if let Some(tx) = ready_opt.take() {
+                        let _ = tx.send(Ok(()));
+                    }
+                    let _ = events_tx.send(ChatUiEvent::PeersUpdated {
+                        online_peers: filtered,
+                    });
+                }
+                RelayFrame::RelayError {
+                    ref code,
+                    ref detail,
+                    ..
+                } if ready_opt.is_some()
+                    && matches!(
+                        code.as_str(),
+                        "auth_failed" | "identity_mismatch" | "id_in_use" | "invalid_id" | "auth_timeout"
+                    ) =>
+                {
+                    if let Some(tx) = ready_opt.take() {
+                        let _ = tx.send(Err(format!("relay rejected registration ({code}): {detail}")));
+                    }
+                    break;
+                }
+                other => {
+                    Self::handle_relay_frame(
+                        &self_id,
+                        &identity,
+                        &inner,
+                        &out_tx,
+                        &events_tx,
+                        other,
+                    )
+                    .await;
+                }
+            }
+        }
+
+        if let Some(tx) = ready_opt.take() {
+            let _ = tx.send(Err("connection closed before relay authentication completed".to_string()));
+        }
+        writer.abort();
     }
 
     pub fn client_id(&self) -> &str {
@@ -231,7 +360,19 @@ impl ChatNode {
     }
 
     pub fn device_hw_id_hex(&self) -> String {
-        hex::encode(self.hw.device_hw_id())
+        hex::encode(self.device_hw_id)
+    }
+
+    pub fn ed25519_pub(&self) -> [u8; 32] {
+        self.ed25519_pub
+    }
+
+    pub fn ed25519_pub_hex(&self) -> String {
+        hex::encode(self.ed25519_pub)
+    }
+
+    pub fn backend_label(&self) -> &str {
+        &self.backend_label
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<ChatUiEvent> {
@@ -246,14 +387,22 @@ impl ChatNode {
             .insert(peer_id.to_string(), psk.to_string());
     }
 
-    pub async fn online_peers(&self) -> Vec<String> {
+    /// Explicitly trusts/updates a peer's Ed25519 public key after out-of-band verification.
+    pub async fn pin_peer_ed25519(&self, peer_id: &str, pubkey: [u8; 32]) -> Result<(), String> {
+        self.identity.lock().await.pin_peer_key(peer_id, pubkey)
+    }
+
+    pub async fn online_peers(&self) -> Vec<PeerIdentity> {
+        self.inner.read().await.online_peers.clone()
+    }
+
+    pub async fn online_peer_ids(&self) -> Vec<String> {
         self.inner
             .read()
             .await
             .online_peers
             .iter()
-            .filter(|p| *p != &self.client_id)
-            .cloned()
+            .map(|p| p.client_id.clone())
             .collect()
     }
 
@@ -264,6 +413,7 @@ impl ChatNode {
             .iter()
             .map(|(peer_id, ps)| PeerSummary {
                 peer_id: peer_id.clone(),
+                peer_ed25519_hex: hex::encode(ps.peer_ed25519_pub),
                 safety_fingerprint: ps.safety_fingerprint.clone(),
                 profile: ps.profile,
                 tx_stats: ps.session.tx.audit_stats(),
@@ -275,8 +425,8 @@ impl ChatNode {
         out
     }
 
-    /// Initiates an ephemeral X25519 key exchange over the blind relay to provision a paired
-    /// `DuplexCubeSession` with `peer_id`.
+    /// Initiates an Ed25519-signed X25519 key exchange over the blind relay with independent
+    /// initial DH ratchet keys.
     pub async fn initiate_pair(
         &self,
         peer_id: &str,
@@ -286,11 +436,8 @@ impl ChatNode {
         if peer_id == self.client_id {
             return Err("cannot pair with yourself".to_string());
         }
-        let mut raw_sk = [0u8; 32];
-        getrandom::getrandom(&mut raw_sk).map_err(|e| e.to_string())?;
-        let secret = StaticSecret::from(raw_sk);
-        raw_sk.zeroize();
-        let pub_bytes = PublicKey::from(&secret).to_bytes();
+        let (eph_secret, eph_pub) = generate_static_x25519()?;
+        let (init_rx_dh_secret, init_rx_dh_pub) = generate_raw_x25519()?;
 
         let seq = self.id_counter.fetch_add(1, Ordering::Relaxed);
         let pair_id = format!("{}-{}-{}", self.client_id, peer_id, seq);
@@ -301,28 +448,45 @@ impl ChatNode {
             pair_id.clone(),
             PendingPairOut {
                 peer_id: peer_id.to_string(),
-                secret,
-                pub_bytes,
+                eph_secret,
+                eph_pub,
+                init_rx_dh_secret,
+                init_rx_dh_pub,
                 profile,
                 psk: psk_str,
             },
         );
+
+        let msg_bytes = pair_offer_sign_bytes(
+            &self.client_id,
+            peer_id,
+            &pair_id,
+            &eph_pub,
+            &init_rx_dh_pub,
+            &self.ed25519_pub,
+            profile,
+            has_psk,
+        );
+        let signature = self.identity.lock().await.sign(&msg_bytes);
 
         self.ws_out
             .send(RelayFrame::PairOffer {
                 from: self.client_id.clone(),
                 to: peer_id.to_string(),
                 pair_id: pair_id.clone(),
-                eph_pub: pub_bytes,
+                eph_pub,
+                init_rx_dh_pub,
+                sender_ed25519_pub: self.ed25519_pub,
                 profile,
                 has_psk,
+                signature,
             })
             .map_err(|_| "relay channel closed".to_string())?;
 
         Ok(pair_id)
     }
 
-    /// Explicitly accepts a pending PIN-protected pairing request from `peer_id`.
+    /// Explicitly accepts a verified pending pairing request from `peer_id`.
     pub async fn accept_pair_offer(&self, peer_id: &str, psk: &str) -> Result<String, String> {
         let offer = self
             .inner
@@ -333,7 +497,7 @@ impl ChatNode {
             .ok_or_else(|| format!("no pending pair request from '{peer_id}'"))?;
         Self::complete_incoming_offer(
             &self.client_id,
-            &self.hw,
+            &self.identity,
             &self.inner,
             &self.ws_out,
             &self.events_tx,
@@ -344,7 +508,7 @@ impl ChatNode {
     }
 
     /// Sends a message (or compact <=24B `RawCore256` payload) and awaits receiver `DeliveryAck`.
-    /// On timeout or offline peer, rolls back the sender's cellular mesh cleanly!
+    /// Uses 256-byte bucket padding for AEAD chat payloads and rolls back cleanly on drop/timeout.
     pub async fn send_message(
         &self,
         peer_id: &str,
@@ -354,9 +518,8 @@ impl ChatNode {
         self.send_with_noise(peer_id, text, raw_core_mode, 0).await
     }
 
-    /// Sends a message with optional simulated wire bit-rot (`flip_bytes` bytes flipped across
-    /// non-overlapping offsets of `partial_256b` and `partial_1000b` shadow) to demonstrate
-    /// live Bitwise Majority Voting (TMR) recovery across the WebSocket relay.
+    /// Sends a message with optional simulated wire bit-rot (`flip_bytes` bytes corrupted) to
+    /// exercise live Bitwise Majority Voting (TMR) recovery.
     pub async fn send_with_noise(
         &self,
         peer_id: &str,
@@ -367,7 +530,17 @@ impl ChatNode {
         let msg_seq = self.id_counter.fetch_add(1, Ordering::Relaxed);
         let msg_id = format!("msg-{}-{msg_seq}", self.client_id);
 
+        let padded_envelope = if raw_core_mode {
+            None
+        } else {
+            Some(encode_padded_chat_payload(text.as_bytes())?)
+        };
+
         let (packet, rx_ack, wire_bytes, mode_label) = {
+            let id_guard = self.identity.lock().await;
+            let hw = id_guard.hardware_provider().clone();
+            drop(id_guard);
+
             let mut guard = self.inner.write().await;
             let ps = guard
                 .sessions
@@ -376,11 +549,11 @@ impl ChatNode {
 
             let mut pkt = if raw_core_mode {
                 ps.session
-                    .begin_send_raw_core(&*self.hw, text.as_bytes())
+                    .begin_send_raw_core(&hw, text.as_bytes())
                     .map_err(|e| e.to_string())?
             } else {
                 ps.session
-                    .begin_send_message(&*self.hw, text.as_bytes())
+                    .begin_send_message(&hw, padded_envelope.as_ref().unwrap())
                     .map_err(|e| e.to_string())?
             };
 
@@ -464,21 +637,40 @@ impl ChatNode {
         }
     }
 
-    /// Triggers synchronized Bijective Epoch Hopping on `tx` mesh and notifies `peer_id`.
+    /// Triggers synchronized Bijective Epoch Hopping + DH Ratchet advancement on `tx`
+    /// and delivers an Ed25519-signed notice to `peer_id`.
     pub async fn hop_epoch(&self, peer_id: &str) -> Result<u64, String> {
-        let new_epoch = {
+        let id_guard = self.identity.lock().await;
+        let hw = id_guard.hardware_provider().clone();
+        let (new_epoch, epoch_eph_pub) = {
             let mut guard = self.inner.write().await;
             let ps = guard
                 .sessions
                 .get_mut(peer_id)
                 .ok_or_else(|| format!("not paired with '{peer_id}'"))?;
-            ps.session.tx.hop_epoch(&*self.hw).map_err(|e| e.to_string())?
+            ps.session
+                .hop_epoch_tx_ratchet(&hw)
+                .map_err(|e| e.to_string())?
         };
+
+        let sign_msg = epoch_hop_sign_bytes(
+            &self.client_id,
+            peer_id,
+            new_epoch,
+            &epoch_eph_pub,
+            &self.ed25519_pub,
+        );
+        let signature = id_guard.sign(&sign_msg);
+        drop(id_guard);
+
         self.ws_out
             .send(RelayFrame::EpochHopNotice {
                 from: self.client_id.clone(),
                 to: peer_id.to_string(),
                 new_epoch,
+                epoch_eph_pub,
+                sender_ed25519_pub: self.ed25519_pub,
+                signature,
             })
             .map_err(|_| "relay channel closed".to_string())?;
         let _ = self.events_tx.send(ChatUiEvent::EpochHopped {
@@ -489,9 +681,9 @@ impl ChatNode {
         Ok(new_epoch)
     }
 
-    /// Runs `decrypt_zero_oracle` against a tampered probe on `peer_id`'s RX mesh to demonstrate
-    /// Honey DTE output without mutating or desyncing the live chat mesh.
+    /// Executes constant-work `decrypt_zero_oracle` against a tampered probe on `peer_id`'s RX mesh.
     pub async fn simulate_honey_probe(&self, peer_id: &str) -> Result<String, String> {
+        let hw = self.identity.lock().await.hardware_provider().clone();
         let mut guard = self.inner.write().await;
         let ps = guard
             .sessions
@@ -507,13 +699,14 @@ impl ChatNode {
             },
             sequence: ps.session.rx.sequence() + 1,
             epoch: ps.session.rx.epoch(),
+            ratchet_pub: [0x11u8; 32],
             payload_mode: PayloadMode::RawCore256,
             packet_mac: [0xFFu8; 32],
         };
 
         match ps
             .session
-            .decrypt_zero_oracle(&*self.hw, &forged, HoneyProfile::ChatPlaintext)
+            .decrypt_zero_oracle(&hw, &forged, HoneyProfile::ChatPlaintext)
         {
             ReceiveOutcome::HoneyDeception {
                 plausible_output, ..
@@ -521,7 +714,7 @@ impl ChatNode {
                 let txt = String::from_utf8_lossy(&plausible_output).to_string();
                 let _ = self.events_tx.send(ChatUiEvent::HoneyProbeResult {
                     peer_id: peer_id.to_string(),
-                    outcome: "HoneyDeception (zero error oracle, zero desync)".to_string(),
+                    outcome: "HoneyDeception (constant-work zero oracle, zero desync)".to_string(),
                     output: txt.clone(),
                 });
                 Ok(txt)
@@ -549,18 +742,17 @@ impl ChatNode {
 
     async fn handle_relay_frame(
         self_id: &str,
-        hw: &Arc<OsBoundHardwareProvider>,
+        identity: &Arc<Mutex<DeviceIdentity>>,
         inner: &Arc<RwLock<NodeInner>>,
         ws_out: &mpsc::UnboundedSender<RelayFrame>,
         events_tx: &broadcast::Sender<ChatUiEvent>,
         frame: RelayFrame,
     ) {
         match frame {
-            RelayFrame::Registered { online_peers, .. }
-            | RelayFrame::PeerList { online_peers } => {
-                let filtered: Vec<String> = online_peers
+            RelayFrame::PeerList { online_peers } => {
+                let filtered: Vec<PeerIdentity> = online_peers
                     .into_iter()
-                    .filter(|p| p != self_id)
+                    .filter(|p| p.client_id != self_id)
                     .collect();
                 inner.write().await.online_peers = filtered.clone();
                 let _ = events_tx.send(ChatUiEvent::PeersUpdated {
@@ -569,24 +761,62 @@ impl ChatNode {
             }
             RelayFrame::PairOffer {
                 from,
+                to,
                 pair_id,
                 eph_pub,
+                init_rx_dh_pub,
+                sender_ed25519_pub,
                 profile,
                 has_psk,
-                ..
+                signature,
             } => {
+                let sign_msg = pair_offer_sign_bytes(
+                    &from,
+                    &to,
+                    &pair_id,
+                    &eph_pub,
+                    &init_rx_dh_pub,
+                    &sender_ed25519_pub,
+                    profile,
+                    has_psk,
+                );
+                if to != self_id
+                    || !DeviceIdentity::verify_signature(&sender_ed25519_pub, &sign_msg, &signature)
+                {
+                    let _ = events_tx.send(ChatUiEvent::Notice {
+                        level: "security_alert".to_string(),
+                        text: format!("REJECTED forged or misrouted PairOffer from '{from}'"),
+                    });
+                    return;
+                }
+
+                if let Err(alert) = identity
+                    .lock()
+                    .await
+                    .verify_or_pin_peer(&from, sender_ed25519_pub)
+                {
+                    let _ = events_tx.send(ChatUiEvent::Notice {
+                        level: "security_alert".to_string(),
+                        text: alert,
+                    });
+                    return;
+                }
+
                 let preset = inner.read().await.preset_psks.get(&from).cloned();
                 let offer = IncomingPairOffer {
                     from: from.clone(),
                     pair_id: pair_id.clone(),
                     eph_pub,
+                    init_rx_dh_pub,
+                    sender_ed25519_pub,
                     profile,
                     has_psk,
                 };
-                if !has_psk || preset.is_some() {
-                    let psk = preset.unwrap_or_default();
+                // Only auto-accept when this client explicitly pre-authorized a peer PSK;
+                // all other offers require explicit operator approval via `/accept`.
+                if let Some(psk) = preset {
                     let _ = Self::complete_incoming_offer(
-                        self_id, hw, inner, ws_out, events_tx, offer, &psk,
+                        self_id, identity, inner, ws_out, events_tx, offer, &psk,
                     )
                     .await;
                 } else {
@@ -597,6 +827,7 @@ impl ChatNode {
                         .insert(from.clone(), offer);
                     let _ = events_tx.send(ChatUiEvent::IncomingPairRequest {
                         from,
+                        from_ed25519_hex: hex::encode(sender_ed25519_pub),
                         pair_id,
                         profile,
                         has_psk,
@@ -605,16 +836,65 @@ impl ChatNode {
             }
             RelayFrame::PairAccept {
                 from,
+                to,
                 pair_id,
                 eph_pub,
-                ..
+                init_rx_dh_pub,
+                sender_ed25519_pub,
+                signature,
             } => {
                 let pending = inner.write().await.pending_offers_out.remove(&pair_id);
                 let Some(p) = pending else {
                     return;
                 };
+                if to != self_id || from != p.peer_id {
+                    let _ = events_tx.send(ChatUiEvent::Notice {
+                        level: "security_alert".to_string(),
+                        text: format!("REJECTED PairAccept from unexpected sender '{from}'"),
+                    });
+                    return;
+                }
+
+                let sign_msg = pair_accept_sign_bytes(
+                    &from,
+                    self_id,
+                    &pair_id,
+                    &p.eph_pub,
+                    &eph_pub,
+                    &init_rx_dh_pub,
+                    &sender_ed25519_pub,
+                );
+                if !DeviceIdentity::verify_signature(&sender_ed25519_pub, &sign_msg, &signature) {
+                    let _ = events_tx.send(ChatUiEvent::Notice {
+                        level: "security_alert".to_string(),
+                        text: format!("REJECTED PairAccept from '{from}' with invalid Ed25519 signature"),
+                    });
+                    return;
+                }
+
+                let mut id_guard = identity.lock().await;
+                if let Err(alert) = id_guard.verify_or_pin_peer(&from, sender_ed25519_pub) {
+                    let _ = events_tx.send(ChatUiEvent::Notice {
+                        level: "security_alert".to_string(),
+                        text: alert,
+                    });
+                    return;
+                }
+                let hw = id_guard.hardware_provider().clone();
+                let my_ed_pub = id_guard.ed25519_pub();
+                drop(id_guard);
+
                 let peer_pub = PublicKey::from(eph_pub);
-                let mut shared = p.secret.diffie_hellman(&peer_pub).to_bytes();
+                let shared_obj = p.eph_secret.diffie_hellman(&peer_pub);
+                if !shared_obj.was_contributory() {
+                    let _ = events_tx.send(ChatUiEvent::Notice {
+                        level: "security_alert".to_string(),
+                        text: format!("REJECTED non-contributory X25519 PairAccept from '{from}'"),
+                    });
+                    return;
+                }
+                let mut shared = shared_obj.to_bytes();
+
                 match provision_duplex_from_ecdh(
                     PairTranscriptParams {
                         profile: p.profile,
@@ -623,25 +903,33 @@ impl ChatNode {
                         pair_id: &pair_id,
                         offerer_id: self_id,
                         accepter_id: &from,
-                        offerer_pub: &p.pub_bytes,
+                        offerer_pub: &p.eph_pub,
                         accepter_pub: &eph_pub,
+                        offerer_ed25519_pub: &my_ed_pub,
+                        accepter_ed25519_pub: &sender_ed25519_pub,
+                        my_rx_dh_secret: &p.init_rx_dh_secret,
+                        my_rx_dh_pub: &p.init_rx_dh_pub,
+                        peer_rx_dh_pub: &init_rx_dh_pub,
                         is_offerer: true,
                     },
-                    &**hw,
+                    &hw,
                 ) {
                     Ok(derived) => {
                         let fp = derived.safety_fingerprint.clone();
+                        let peer_ed_hex = hex::encode(sender_ed25519_pub);
                         inner.write().await.sessions.insert(
                             p.peer_id.clone(),
                             PeerChatSession {
                                 session: derived.session,
+                                peer_ed25519_pub: sender_ed25519_pub,
                                 safety_fingerprint: fp.clone(),
                                 profile: p.profile,
                                 messages: Vec::new(),
                             },
                         );
                         let _ = events_tx.send(ChatUiEvent::Paired {
-                            peer_id: p.peer_id,
+                            peer_id: p.peer_id.clone(),
+                            peer_ed25519_hex: peer_ed_hex,
                             safety_fingerprint: fp,
                             profile: p.profile,
                         });
@@ -661,35 +949,43 @@ impl ChatNode {
                 mut packet,
                 ..
             } => {
+                let hw = identity.lock().await.hardware_provider().clone();
                 let wire_bytes = packet.wire_cube.total_byte_len();
-                let mode_str = if matches!(packet.payload_mode, PayloadMode::RawCore256) {
-                    "RawCore256"
-                } else {
-                    "ArbitraryAEAD"
-                };
+                let is_raw = matches!(packet.payload_mode, PayloadMode::RawCore256);
+                let mode_str = if is_raw { "RawCore256" } else { "ArbitraryAEAD" };
 
                 let result = {
                     let mut guard = inner.write().await;
                     if let Some(ps) = guard.sessions.get_mut(&from) {
-                        match ps.session.receive_authenticated(&**hw, &mut packet) {
+                        match ps.session.receive_authenticated(&hw, &mut packet) {
                             Ok((pt, ack, healed_bits)) => {
-                                let text = String::from_utf8_lossy(&pt).to_string();
-                                let rec = ChatRecord {
-                                    msg_id: msg_id.clone(),
-                                    direction: "in".to_string(),
-                                    peer_id: from.clone(),
-                                    text,
-                                    mode: mode_str.to_string(),
-                                    status: if healed_bits > 0 {
-                                        format!("healed_{healed_bits}_bits")
-                                    } else {
-                                        "verified".to_string()
-                                    },
-                                    healed_bits,
-                                    wire_bytes,
+                                let raw_bytes = if is_raw {
+                                    Ok(pt)
+                                } else {
+                                    decode_padded_chat_payload(&pt)
                                 };
-                                ps.messages.push(rec.clone());
-                                Ok((rec, ack))
+                                match raw_bytes {
+                                    Ok(actual_pt) => {
+                                        let text = String::from_utf8_lossy(&actual_pt).to_string();
+                                        let rec = ChatRecord {
+                                            msg_id: msg_id.clone(),
+                                            direction: "in".to_string(),
+                                            peer_id: from.clone(),
+                                            text,
+                                            mode: mode_str.to_string(),
+                                            status: if healed_bits > 0 {
+                                                format!("healed_{healed_bits}_bits")
+                                            } else {
+                                                "verified".to_string()
+                                            },
+                                            healed_bits,
+                                            wire_bytes,
+                                        };
+                                        ps.messages.push(rec.clone());
+                                        Ok((rec, ack))
+                                    }
+                                    Err(e) => Err(format!("invalid padded chat payload from {from}: {e}")),
+                                }
                             }
                             Err(e) => Err(format!("rejected packet from {from}: {e}")),
                         }
@@ -719,9 +1015,10 @@ impl ChatNode {
             RelayFrame::AckFrame {
                 from, msg_id, ack, ..
             } => {
+                let hw = identity.lock().await.hardware_provider().clone();
                 let mut guard = inner.write().await;
                 let commit_res = if let Some(ps) = guard.sessions.get_mut(&from) {
-                    match ps.session.commit_ack(&**hw, &ack) {
+                    match ps.session.commit_ack(&hw, &ack) {
                         Ok(()) => {
                             if let Some(m) = ps.messages.iter_mut().find(|m| m.msg_id == msg_id) {
                                 m.status = "delivered_ack".to_string();
@@ -746,18 +1043,49 @@ impl ChatNode {
                 }
             }
             RelayFrame::EpochHopNotice {
-                from, new_epoch, ..
+                from,
+                to,
+                new_epoch,
+                epoch_eph_pub,
+                sender_ed25519_pub,
+                signature,
             } => {
+                let sign_msg = epoch_hop_sign_bytes(
+                    &from,
+                    &to,
+                    new_epoch,
+                    &epoch_eph_pub,
+                    &sender_ed25519_pub,
+                );
+                if to != self_id
+                    || !DeviceIdentity::verify_signature(&sender_ed25519_pub, &sign_msg, &signature)
+                {
+                    let _ = events_tx.send(ChatUiEvent::Notice {
+                        level: "security_alert".to_string(),
+                        text: format!("REJECTED unsigned/forged EpochHopNotice from '{from}'"),
+                    });
+                    return;
+                }
+
+                let hw = identity.lock().await.hardware_provider().clone();
                 let mut guard = inner.write().await;
                 if let Some(ps) = guard.sessions.get_mut(&from) {
-                    while ps.session.rx.epoch() < new_epoch {
-                        if let Err(e) = ps.session.rx.hop_epoch(&**hw) {
-                            let _ = events_tx.send(ChatUiEvent::Notice {
-                                level: "error".to_string(),
-                                text: format!("epoch hop sync failed: {e}"),
-                            });
-                            return;
-                        }
+                    if ps.peer_ed25519_pub != sender_ed25519_pub {
+                        let _ = events_tx.send(ChatUiEvent::Notice {
+                            level: "security_alert".to_string(),
+                            text: format!("REJECTED EpochHopNotice from '{from}': Ed25519 key mismatch"),
+                        });
+                        return;
+                    }
+                    if let Err(e) = ps
+                        .session
+                        .hop_epoch_rx_ratchet(&hw, new_epoch, epoch_eph_pub)
+                    {
+                        let _ = events_tx.send(ChatUiEvent::Notice {
+                            level: "error".to_string(),
+                            text: format!("epoch hop sync failed: {e}"),
+                        });
+                        return;
                     }
                     let _ = events_tx.send(ChatUiEvent::EpochHopped {
                         peer_id: from,
@@ -787,27 +1115,47 @@ impl ChatNode {
                     text: format!("relay error ({code}): {detail}"),
                 });
             }
-            RelayFrame::Register { .. } => {}
+            RelayFrame::AuthChallenge { .. }
+            | RelayFrame::RegisterAuth { .. }
+            | RelayFrame::Registered { .. } => {}
         }
     }
 
     async fn complete_incoming_offer(
         self_id: &str,
-        hw: &Arc<OsBoundHardwareProvider>,
+        identity: &Arc<Mutex<DeviceIdentity>>,
         inner: &Arc<RwLock<NodeInner>>,
         ws_out: &mpsc::UnboundedSender<RelayFrame>,
         events_tx: &broadcast::Sender<ChatUiEvent>,
         offer: IncomingPairOffer,
         psk: &str,
     ) -> Result<String, String> {
-        let mut raw_sk = [0u8; 32];
-        getrandom::getrandom(&mut raw_sk).map_err(|e| e.to_string())?;
-        let secret = StaticSecret::from(raw_sk);
-        raw_sk.zeroize();
-        let my_pub = PublicKey::from(&secret).to_bytes();
+        let (eph_secret, my_pub) = generate_static_x25519()?;
+        let (mut init_rx_dh_secret, init_rx_dh_pub) = generate_raw_x25519()?;
 
         let peer_pub = PublicKey::from(offer.eph_pub);
-        let mut shared = secret.diffie_hellman(&peer_pub).to_bytes();
+        let shared_obj = eph_secret.diffie_hellman(&peer_pub);
+        if !shared_obj.was_contributory() {
+            init_rx_dh_secret.zeroize();
+            return Err("rejected non-contributory X25519 PairOffer".to_string());
+        }
+        let mut shared = shared_obj.to_bytes();
+
+        let id_guard = identity.lock().await;
+        let hw = id_guard.hardware_provider().clone();
+        let my_ed_pub = id_guard.ed25519_pub();
+        let sign_msg = pair_accept_sign_bytes(
+            self_id,
+            &offer.from,
+            &offer.pair_id,
+            &offer.eph_pub,
+            &my_pub,
+            &init_rx_dh_pub,
+            &my_ed_pub,
+        );
+        let accept_sig = id_guard.sign(&sign_msg);
+        drop(id_guard);
+
         let derived = provision_duplex_from_ecdh(
             PairTranscriptParams {
                 profile: offer.profile,
@@ -818,18 +1166,26 @@ impl ChatNode {
                 accepter_id: self_id,
                 offerer_pub: &offer.eph_pub,
                 accepter_pub: &my_pub,
+                offerer_ed25519_pub: &offer.sender_ed25519_pub,
+                accepter_ed25519_pub: &my_ed_pub,
+                my_rx_dh_secret: &init_rx_dh_secret,
+                my_rx_dh_pub: &init_rx_dh_pub,
+                peer_rx_dh_pub: &offer.init_rx_dh_pub,
                 is_offerer: false,
             },
-            &**hw,
+            &hw,
         )
         .map_err(|e| e.to_string())?;
         shared.zeroize();
+        init_rx_dh_secret.zeroize();
 
         let fp = derived.safety_fingerprint.clone();
+        let peer_ed_hex = hex::encode(offer.sender_ed25519_pub);
         inner.write().await.sessions.insert(
             offer.from.clone(),
             PeerChatSession {
                 session: derived.session,
+                peer_ed25519_pub: offer.sender_ed25519_pub,
                 safety_fingerprint: fp.clone(),
                 profile: offer.profile,
                 messages: Vec::new(),
@@ -842,16 +1198,37 @@ impl ChatNode {
                 to: offer.from.clone(),
                 pair_id: offer.pair_id,
                 eph_pub: my_pub,
+                init_rx_dh_pub,
+                sender_ed25519_pub: my_ed_pub,
+                signature: accept_sig,
             })
             .map_err(|_| "relay channel closed".to_string())?;
 
         let _ = events_tx.send(ChatUiEvent::Paired {
             peer_id: offer.from,
+            peer_ed25519_hex: peer_ed_hex,
             safety_fingerprint: fp.clone(),
             profile: offer.profile,
         });
         Ok(fp)
     }
+}
+
+fn generate_raw_x25519() -> Result<([u8; 32], [u8; 32]), String> {
+    let mut raw_sk = [0u8; 32];
+    getrandom::getrandom(&mut raw_sk).map_err(|e| e.to_string())?;
+    let secret = StaticSecret::from(raw_sk);
+    let pub_bytes = PublicKey::from(&secret).to_bytes();
+    Ok((raw_sk, pub_bytes))
+}
+
+fn generate_static_x25519() -> Result<(StaticSecret, [u8; 32]), String> {
+    let mut raw_sk = [0u8; 32];
+    getrandom::getrandom(&mut raw_sk).map_err(|e| e.to_string())?;
+    let secret = StaticSecret::from(raw_sk);
+    raw_sk.zeroize();
+    let pub_bytes = PublicKey::from(&secret).to_bytes();
+    Ok((secret, pub_bytes))
 }
 
 impl Drop for ChatNode {
