@@ -1,9 +1,11 @@
 pub mod client;
+pub mod keystore;
 pub mod protocol;
 pub mod relay;
-pub mod web_ui;
+pub mod tls;
 
 pub use client::{ChatNode, ChatRecord, ChatUiEvent, PeerSummary};
-pub use protocol::{ChatMeshProfile, RelayFrame, RelayTrafficEvent};
-pub use relay::{build_relay_router, start_relay_server, BlindRelayState, TelemetrySnapshot};
-pub use web_ui::start_web_ui;
+pub use keystore::DeviceIdentity;
+pub use protocol::{ChatMeshProfile, PeerIdentity, RelayFrame, RelayTrafficEvent};
+pub use relay::{start_relay_server, BlindRelayState, StartedRelay, TelemetrySnapshot};
+pub use tls::{parse_sha256_pin_hex, ClientTlsConfig, RelayTlsConfig};

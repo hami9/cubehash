@@ -1,122 +1,410 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use cubehash_chat::{start_relay_server, start_web_ui, ChatMeshProfile, ChatNode};
+use cubehash_chat::{
+    parse_sha256_pin_hex, start_relay_server, ChatMeshProfile, ChatNode, ChatUiEvent,
+    ClientTlsConfig, DeviceIdentity, RelayTlsConfig,
+};
+use cubehash_core::HardwareProvider;
 
-async fn wait_until<F, Fut>(mut cond: F)
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    for _ in 0..50 {
-        if cond().await {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("condition timed out");
+fn unique_temp_dir(label: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "cubehash_chat_e2e_{label}_{}_{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    dir
 }
 
 #[tokio::test]
-async fn test_e2e_blind_relay_x25519_chat_tmr_epoch_and_rollback() {
-    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let (relay_addr, relay_state, relay_handle) = start_relay_server(bind_addr).await.unwrap();
-    let ws_url = format!("ws://{relay_addr}/ws");
+async fn test_wss_tls_ed25519_ratchet_padding_tmr_honey_and_rollback() {
+    let relay = start_relay_server(
+        "127.0.0.1:0".parse().unwrap(),
+        RelayTlsConfig::SelfSigned {
+            san_hosts: vec!["localhost".into(), "127.0.0.1".into()],
+        },
+    )
+    .await
+    .expect("start wss relay");
+    assert!(relay.is_tls);
+    let pin_hex = relay
+        .tls_cert_sha256_hex
+        .as_ref()
+        .expect("self-signed pin hex")
+        .clone();
+    let pin_digest = parse_sha256_pin_hex(&pin_hex).expect("parse sha256 pin");
+    let cert_pem = relay
+        .tls_cert_pem
+        .as_ref()
+        .expect("self-signed cert PEM")
+        .as_bytes()
+        .to_vec();
 
-    let alice = ChatNode::connect("alice", &ws_url, [0x11u8; 32])
-        .await
-        .unwrap();
-    let bob = ChatNode::connect("bob", &ws_url, [0x22u8; 32])
-        .await
-        .unwrap();
+    let wss_url = format!("wss://{}/ws", relay.addr);
+    let ws_url = format!("ws://{}/ws", relay.addr);
 
-    // Verify local Web UI starts cleanly on localhost for Alice
-    let (ui_addr, ui_handle) = start_web_ui(bind_addr, alice.clone()).await.unwrap();
-    assert!(ui_addr.port() > 0);
+    // 1. Refuse ws:// without explicit --insecure-ws opt-in.
+    let insecure_probe_id = DeviceIdentity::ephemeral_csprng("probe-ws").unwrap();
+    let err_ws = ChatNode::connect_with_config(
+        insecure_probe_id,
+        &ws_url,
+        ClientTlsConfig::WebPkiRoots,
+        false,
+    )
+    .await
+    .err()
+    .expect("must refuse plain ws:// by default");
+    assert!(err_ws.contains("insecure-ws") || err_ws.contains("wss://"));
 
-    wait_until(|| async { alice.online_peers().await.contains(&"bob".to_string()) }).await;
-
-    // 1. Pair with shared PIN/PSK over X25519 via blind relay
-    bob.set_preset_psk("alice", "secret-pin-42").await;
-    alice
-        .initiate_pair("bob", Some("secret-pin-42"), ChatMeshProfile::Standard)
-        .await
-        .unwrap();
-
-    wait_until(|| async {
-        alice.paired_summaries().await.len() == 1 && bob.paired_summaries().await.len() == 1
-    })
-    .await;
-
-    let a_sum = &alice.paired_summaries().await[0];
-    let b_sum = &bob.paired_summaries().await[0];
-    assert_eq!(a_sum.safety_fingerprint, b_sum.safety_fingerprint);
-    assert_eq!(a_sum.tx_stats.mesh_size, 100);
-
-    // 2. Send compact RawCore256 message + full UTF-8 Persian chat message concurrently
-    let r1 = alice.send_message("bob", "RAW-24B-KEY-MATERIAL", true).await.unwrap();
-    assert_eq!(r1.mode, "RawCore256");
-
-    let secret_text = "سلام باب! پیام تست رمزنگاری چت با CubeHash روی رله کور 🚀";
-    let (res_a, res_b) = tokio::join!(
-        alice.send_message("bob", secret_text, false),
-        bob.send_message("alice", "Hello Alice! Bidirectional ACK OK.", false)
+    // 2. Refuse wss:// when pinned certificate digest mismatches (MITM defense).
+    let wrong_pin_id = DeviceIdentity::ephemeral_csprng("wrong-pin").unwrap();
+    let err_pin = ChatNode::connect_with_config(
+        wrong_pin_id,
+        &wss_url,
+        ClientTlsConfig::PinnedCertSha256([0xAAu8; 32]),
+        false,
+    )
+    .await
+    .err()
+    .expect("must reject mismatched TLS pin");
+    assert!(
+        err_pin.contains("TLS handshake failed") || err_pin.contains("certificate"),
+        "unexpected error: {err_pin}"
     );
-    assert_eq!(res_a.unwrap().status, "delivered_ack");
-    assert_eq!(res_b.unwrap().status, "delivered_ack");
 
-    // 3. Inject real network bit-rot (8 bytes corrupted across wire cube + shadow) -> TMR heals it live!
-    let noisy_text = "Message surviving 64-bit wire corruption!";
-    let r_noise = alice
-        .send_with_noise("bob", noisy_text, false, 8)
-        .await
-        .unwrap();
-    assert_eq!(r_noise.status, "delivered_ack");
+    // 3. Connect Alice (pinned leaf digest) and Bob (CA PEM).
+    let alice_id = DeviceIdentity::ephemeral_csprng("alice").unwrap();
+    let bob_id = DeviceIdentity::ephemeral_csprng("bob").unwrap();
+    let bob_ed25519 = bob_id.ed25519_pub();
 
-    let bob_msgs = &bob.paired_summaries().await[0].messages;
-    let healed_rec = bob_msgs.iter().find(|m| m.text == noisy_text).unwrap();
-    assert!(healed_rec.healed_bits > 0);
+    let alice = ChatNode::connect_with_config(
+        alice_id,
+        &wss_url,
+        ClientTlsConfig::PinnedCertSha256(pin_digest),
+        false,
+    )
+    .await
+    .expect("alice connect wss pinned");
+    let bob = ChatNode::connect_with_config(
+        bob_id.clone(),
+        &wss_url,
+        ClientTlsConfig::CaPem(cert_pem),
+        false,
+    )
+    .await
+    .expect("bob connect wss ca_pem");
 
-    // 4. Epoch Hopping across the relay + post-hop messaging
-    let new_ep = alice.hop_epoch("bob").await.unwrap();
-    assert_eq!(new_ep, 1);
-    wait_until(|| async { bob.paired_summaries().await[0].rx_stats.epoch == 1 }).await;
+    // Verify relay blocks active impersonation of "bob" with a different Ed25519 key.
+    let impostor_active = DeviceIdentity::ephemeral_csprng("bob").unwrap();
+    let err_active = ChatNode::connect_with_config(
+        impostor_active,
+        &wss_url,
+        ClientTlsConfig::PinnedCertSha256(pin_digest),
+        false,
+    )
+    .await
+    .err()
+    .expect("impostor cannot steal active bob identity");
+    assert!(
+        err_active.contains("identity_mismatch") || err_active.contains("id_in_use"),
+        "unexpected active hijack error: {err_active}"
+    );
 
+    // Explicitly verify out-of-band pinning works too.
     alice
-        .send_message("bob", "Post-epoch-hop verified!", false)
+        .pin_peer_ed25519("bob", bob_ed25519)
         .await
-        .unwrap();
+        .expect("pin bob key");
 
-    // 5. Honey DTE zero-oracle probe does not desync active chat
-    let honey_out = bob.simulate_honey_probe("alice").await.unwrap();
+    let mut alice_events = alice.subscribe();
+    let mut bob_events = bob.subscribe();
+
+    // 4. Pairing WITHOUT preset PSK requires explicit accept_pair_offer on Bob.
+    alice
+        .initiate_pair("bob", Some("482910"), ChatMeshProfile::Standard)
+        .await
+        .expect("alice send PairOffer");
+
+    let mut saw_incoming_req = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(ChatUiEvent::IncomingPairRequest {
+            from,
+            from_ed25519_hex,
+            has_psk,
+            ..
+        })) = tokio::time::timeout(Duration::from_millis(500), bob_events.recv()).await
+        {
+            assert_eq!(from, "alice");
+            assert_eq!(from_ed25519_hex, alice.ed25519_pub_hex());
+            assert!(has_psk);
+            saw_incoming_req = true;
+            break;
+        }
+    }
+    assert!(
+        saw_incoming_req,
+        "bob should receive explicit IncomingPairRequest when preset_psk is unset"
+    );
+    assert!(alice.paired_summaries().await.is_empty());
+
+    let bob_fp = bob
+        .accept_pair_offer("alice", "482910")
+        .await
+        .expect("bob explicitly accepts pair offer");
+
+    let mut alice_fp = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(ChatUiEvent::Paired {
+            peer_id,
+            peer_ed25519_hex,
+            safety_fingerprint,
+            ..
+        })) = tokio::time::timeout(Duration::from_millis(500), alice_events.recv()).await
+        {
+            assert_eq!(peer_id, "bob");
+            assert_eq!(peer_ed25519_hex, bob.ed25519_pub_hex());
+            alice_fp = Some(safety_fingerprint);
+            break;
+        }
+    }
+    assert_eq!(alice_fp.as_deref(), Some(bob_fp.as_str()));
+
+    // 5. Encrypted messages with 256-byte bucketed padding hide length differences.
+    let short_msg = "hi";
+    let medium_msg = "Hello Bob! Testing 256B bucketed AEAD chat padding over wss:// TLS 1.3.";
+    let rec_short = alice
+        .send_message("bob", short_msg, false)
+        .await
+        .expect("send short AEAD");
+    let rec_med = alice
+        .send_message("bob", medium_msg, false)
+        .await
+        .expect("send medium AEAD");
+    assert_eq!(rec_short.status, "delivered_ack");
+    assert_eq!(rec_med.status, "delivered_ack");
+
+    let padding_snap = relay.state.snapshot().await;
+    let alice_aead_events: Vec<_> = padding_snap
+        .recent_frames
+        .iter()
+        .filter(|ev| ev.from == "alice" && ev.to == "bob" && ev.frame_type == "WirePacket (ArbitraryAEAD)")
+        .collect();
+    assert_eq!(alice_aead_events.len(), 2);
+    assert_eq!(
+        alice_aead_events[0].ciphertext_bytes, alice_aead_events[1].ciphertext_bytes,
+        "short and medium messages in same 256B bucket must emit identical AEAD ciphertext bytes"
+    );
+    assert!(
+        alice_aead_events[0].ciphertext_bytes.unwrap_or(0) >= 256,
+        "padded AEAD ciphertext must be at least 256B bucket size"
+    );
+    assert_eq!(
+        alice_aead_events[0].wire_base_bytes, alice_aead_events[1].wire_base_bytes,
+        "base wire cube bytes must be identical"
+    );
+
+    // Verify RawCore256 mode & Bob -> Alice reply + TMR bit-rot recovery.
+    let raw_rec = bob
+        .send_message("alice", "PING#42", true)
+        .await
+        .expect("send RawCore256");
+    assert_eq!(raw_rec.status, "delivered_ack");
+
+    let noisy_text = "Recoverable noisy message with 8 corrupted bytes across TMR replicas!";
+    let noisy_rec = bob
+        .send_with_noise("alice", noisy_text, false, 8)
+        .await
+        .expect("noisy send must heal and ACK");
+    assert_eq!(noisy_rec.status, "delivered_ack");
+
+    let alice_bob_msgs = alice.paired_summaries().await[0].messages.clone();
+    assert!(alice_bob_msgs
+        .iter()
+        .any(|m| m.direction == "in" && m.text == "PING#42"));
+    let healed_entry = alice_bob_msgs
+        .iter()
+        .find(|m| m.direction == "in" && m.text == noisy_text)
+        .expect("alice healed noisy message");
+    assert!(healed_entry.healed_bits > 0);
+
+    // 6. DH-ratcheted epoch hop + subsequent bidirectional messaging.
+    let new_epoch = alice.hop_epoch("bob").await.expect("alice hop epoch");
+    assert_eq!(new_epoch, 1);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    let mut bob_hopped = false;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(ChatUiEvent::EpochHopped {
+            peer_id,
+            direction,
+            new_epoch: ep,
+        })) = tokio::time::timeout(Duration::from_millis(500), bob_events.recv()).await
+        {
+            if peer_id == "alice" && direction == "rx" && ep == 1 {
+                bob_hopped = true;
+                break;
+            }
+        }
+    }
+    assert!(bob_hopped, "bob must process signed EpochHopNotice + DH ratchet");
+
+    let post_hop_ab = alice
+        .send_message("bob", "Alice->Bob post-hop DH ratcheted message!", false)
+        .await
+        .expect("alice->bob post-hop send");
+    assert_eq!(post_hop_ab.status, "delivered_ack");
+
+    let post_hop_ba = bob
+        .send_message("alice", "Bob->Alice post-hop message!", false)
+        .await
+        .expect("bob->alice post-hop send");
+    assert_eq!(post_hop_ba.status, "delivered_ack");
+
+    // 7. Constant-work zero-oracle honey probe does NOT desync Bob's RX mesh.
+    let honey_out = bob
+        .simulate_honey_probe("alice")
+        .await
+        .expect("honey probe returns decoy");
     assert!(!honey_out.is_empty());
-    alice
-        .send_message("bob", "Still synchronized after honey probe!", false)
+
+    let after_honey = alice
+        .send_message("bob", "Genuine frame right after honey probe", false)
         .await
-        .unwrap();
+        .expect("alice->bob continues without desync after honey probe");
+    assert_eq!(after_honey.status, "delivered_ack");
 
-    // 6. Verify Blind Relay saw zero plaintext and zero keys
-    let telemetry = relay_state.snapshot().await;
-    let telemetry_json = serde_json::to_string(&telemetry).unwrap();
-    assert!(!telemetry_json.contains("سلام باب"));
-    assert!(!telemetry_json.contains("RAW-24B-KEY-MATERIAL"));
-    assert!(!telemetry_json.contains("secret-pin-42"));
-    assert!(telemetry.total_routed_frames >= 10);
+    // 8. Blind relay holds ZERO plaintext and ZERO key material.
+    let snap = relay.state.snapshot().await;
+    assert!(snap.total_routed_frames >= 6);
+    let snap_json = serde_json::to_string(&snap).unwrap();
+    assert!(!snap_json.contains("Hello Bob"));
+    assert!(!snap_json.contains("Genuine frame"));
+    assert!(!snap_json.contains("MotherCube"));
 
-    // 7. Disconnect Bob -> Alice's next send rolls back cleanly without desyncing tx sequence!
+    // 9. Drop Bob -> verify offline identity pinning blocks impostor AND Alice rolls back cleanly.
     let tx_seq_before = alice.paired_summaries().await[0].tx_stats.sequence;
     drop(bob);
-    wait_until(|| async { !alice.online_peers().await.contains(&"bob".to_string()) }).await;
-    let err = alice
-        .send_message("bob", "bob is offline", false)
+
+    let wait_offline = tokio::time::Instant::now() + Duration::from_secs(4);
+    while tokio::time::Instant::now() < wait_offline {
+        if !alice.online_peer_ids().await.iter().any(|p| p == "bob") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Impostor cannot register as offline "bob" with a different Ed25519 key.
+    let offline_impostor = DeviceIdentity::ephemeral_csprng("bob").unwrap();
+    let err_offline_pin = ChatNode::connect_with_config(
+        offline_impostor,
+        &wss_url,
+        ClientTlsConfig::PinnedCertSha256(pin_digest),
+        false,
+    )
+    .await
+    .err()
+    .expect("offline impostor must be blocked by Ed25519 pin");
+    assert!(err_offline_pin.contains("identity_mismatch"));
+
+    // Reconnect real Bob? Send offline rollback check first while Bob is offline:
+    let offline_send_err = alice
+        .send_message("bob", "this must fail and roll back cleanly", false)
         .await
-        .unwrap_err();
-    assert!(err.contains("rolled back"));
+        .expect_err("sending to offline peer must error");
+    assert!(offline_send_err.contains("offline") || offline_send_err.contains("rolled back"));
+
+    let tx_seq_after = alice.paired_summaries().await[0].tx_stats.sequence;
     assert_eq!(
-        alice.paired_summaries().await[0].tx_stats.sequence,
-        tx_seq_before
+        tx_seq_before, tx_seq_after,
+        "outbound TX sequence must roll back cleanly on offline failure"
     );
 
-    ui_handle.abort();
-    relay_handle.abort();
+    // Verify legitimate Bob key CAN reconnect cleanly after disconnect.
+    let bob_rejoined = ChatNode::connect_with_config(
+        bob_id,
+        &wss_url,
+        ClientTlsConfig::PinnedCertSha256(pin_digest),
+        false,
+    )
+    .await
+    .expect("legitimate bob identity can reconnect");
+    drop(bob_rejoined);
+    drop(alice);
+    relay.handle.abort();
+}
+
+#[tokio::test]
+async fn test_preset_psk_auto_accept_and_dpapi_keystore_persistence() {
+    let ks_dir = unique_temp_dir("dpapi_keystore");
+
+    // Create OS-sealed identity with passphrase and reload across restart.
+    let id1 = DeviceIdentity::load_or_create("alice-store", Some(&ks_dir), Some("2fa-pin-77"))
+        .expect("create sealed keystore");
+    let pub1 = id1.ed25519_pub();
+    let hw1 = id1.hardware_provider().device_hw_id();
+
+    let id1_reloaded =
+        DeviceIdentity::load_or_create("alice-store", Some(&ks_dir), Some("2fa-pin-77"))
+            .expect("reload sealed keystore with correct passphrase");
+    assert_eq!(id1_reloaded.ed25519_pub(), pub1);
+    assert_eq!(id1_reloaded.hardware_provider().device_hw_id(), hw1);
+
+    let wrong_pass =
+        DeviceIdentity::load_or_create("alice-store", Some(&ks_dir), Some("wrong-passphrase"));
+    assert!(wrong_pass.is_err(), "wrong passphrase must fail unseal");
+
+    // Test explicit preset_psk auto-accept path over wss://.
+    let relay = start_relay_server(
+        "127.0.0.1:0".parse().unwrap(),
+        RelayTlsConfig::SelfSigned {
+            san_hosts: vec!["localhost".into(), "127.0.0.1".into()],
+        },
+    )
+    .await
+    .expect("start wss relay");
+    let pin = parse_sha256_pin_hex(relay.tls_cert_sha256_hex.as_ref().unwrap()).unwrap();
+    let url = format!("wss://{}/ws", relay.addr);
+
+    let bob_id = DeviceIdentity::load_or_create("bob-store", Some(&ks_dir), None)
+        .expect("create bob keystore");
+    let alice =
+        ChatNode::connect_with_config(id1_reloaded, &url, ClientTlsConfig::PinnedCertSha256(pin), false)
+            .await
+            .unwrap();
+    let bob = ChatNode::connect_with_config(bob_id, &url, ClientTlsConfig::PinnedCertSha256(pin), false)
+        .await
+        .unwrap();
+
+    bob.set_preset_psk("alice-store", "991122").await;
+    alice
+        .initiate_pair("bob-store", Some("991122"), ChatMeshProfile::Compact)
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    while tokio::time::Instant::now() < deadline {
+        if !alice.paired_summaries().await.is_empty() && !bob.paired_summaries().await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(alice.paired_summaries().await.len(), 1);
+    assert_eq!(bob.paired_summaries().await.len(), 1);
+
+    let res = alice
+        .send_message("bob-store", "Preset PSK + DPAPI persisted!", false)
+        .await
+        .expect("send over auto-accepted Compact profile");
+    assert_eq!(res.status, "delivered_ack");
+
+    drop(alice);
+    drop(bob);
+    relay.handle.abort();
+    let _ = std::fs::remove_dir_all(&ks_dir);
 }
