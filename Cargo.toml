@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cubehash-core",
+    "crates/cubehash-ffi",
+    "crates/cubehash-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["CubeHash Authors"]
+description = "General-purpose hierarchical, self-healing, hardware-bound cellular cube cryptography engine"
+
+[workspace.dependencies]
+blake2 = "0.10"
+chacha20poly1305 = "0.10"
+getrandom = "0.2"
+hex = "0.4"
+hkdf = "0.12"
+hmac = "0.12"
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+sha3 = "0.10"
+subtle = "2.6"
+thiserror = "2.0"
+zeroize = { version = "1.8", features = ["derive"] }

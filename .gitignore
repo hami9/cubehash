@@ -1,0 +1,10 @@
+/target/
+**/*.rs.bk
+*.pdb
+*.lib
+*.dll
+*.so
+*.dylib
+*.exe
+.DS_Store
+Thumbs.db

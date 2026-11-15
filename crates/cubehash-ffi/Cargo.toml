@@ -1,0 +1,15 @@
+[package]
+name = "cubehash-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "C-ABI / FFI bindings for the general-purpose cubehash-core security engine"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+cubehash-core = { path = "../cubehash-core" }
+serde_json.workspace = true
+zeroize.workspace = true

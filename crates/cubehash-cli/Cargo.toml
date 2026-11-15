@@ -1,0 +1,12 @@
+[package]
+name = "cubehash-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Security audit, fault-injection, adversarial verification, and benchmark runner for cubehash-core"
+
+[dependencies]
+cubehash-core = { path = "../cubehash-core" }
+hex.workspace = true
+serde_json.workspace = true
