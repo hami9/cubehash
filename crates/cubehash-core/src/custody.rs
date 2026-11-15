@@ -76,8 +76,8 @@ impl HardwareProvider for VirtualHardwareEnclave {
     }
 }
 
-/// Host-bound hardware provider combining current OS/host environment traits with an explicit
-/// device sealing key (e.g., stored in OS keychain/TPM).
+/// Host-bound hardware provider combining OS/machine hardware identity traits with an explicit
+/// hardware-sealed device key (e.g., from Windows DPAPI/CNG/TPM or Keychain).
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct OsBoundHardwareProvider {
     hw_id: [u8; 16],
@@ -85,9 +85,36 @@ pub struct OsBoundHardwareProvider {
 }
 
 impl OsBoundHardwareProvider {
-    /// Derives a host-bound provider from OS machine traits and a caller-supplied device secret.
+    /// Constructs a provider directly from pre-derived enclave root material.
+    pub fn from_sealed_parts(hw_id: [u8; 16], sealing_key: [u8; 32]) -> Self {
+        Self { hw_id, sealing_key }
+    }
+
+    /// Derives a host-bound provider from OS traits and a caller-supplied device secret.
     pub fn from_host_and_secret(device_secret: &[u8; 32], app_context: &[u8]) -> Self {
-        let mut fingerprint = Vec::with_capacity(128);
+        Self::from_host_and_secret_with_machine_id(device_secret, app_context, None)
+    }
+
+    /// Derives a host-bound provider from explicit hardware machine ID (e.g., Registry
+    /// `MachineGuid` or `/etc/machine-id`), OS environment traits, and a hardware-sealed secret.
+    pub fn from_host_and_secret_with_machine_id(
+        device_secret: &[u8; 32],
+        app_context: &[u8],
+        machine_id: Option<&[u8]>,
+    ) -> Self {
+        let mut fingerprint = Vec::with_capacity(160);
+        if let Some(mid) = machine_id.filter(|m| !m.is_empty()) {
+            fingerprint.extend_from_slice(b"MACHINE_ID=");
+            fingerprint.extend_from_slice(mid);
+            fingerprint.push(0);
+        } else if let Ok(etc_mid) = std::fs::read_to_string("/etc/machine-id") {
+            let trimmed = etc_mid.trim();
+            if !trimmed.is_empty() {
+                fingerprint.extend_from_slice(b"MACHINE_ID=");
+                fingerprint.extend_from_slice(trimmed.as_bytes());
+                fingerprint.push(0);
+            }
+        }
         for key in [
             "COMPUTERNAME",
             "HOSTNAME",
@@ -149,7 +176,7 @@ pub struct LocalClientClockGuard {
 }
 
 impl LocalClientClockGuard {
-    const SEAL_LABEL: &'static [u8] = b"cubehash-local-clock-guard-v1";
+    pub(crate) const SEAL_LABEL: &'static [u8] = b"cubehash-local-clock-guard-v1";
 
     /// Seals a fresh `LocalClientClockGuard` to `hw`.
     pub fn seal_new(hw: &dyn HardwareProvider, raw_hw_secret: &[u8; 32]) -> Result<Self> {

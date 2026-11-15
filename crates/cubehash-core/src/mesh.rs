@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::config::{MeshConfig, FINGERPRINT_BYTES};
@@ -62,6 +63,7 @@ pub struct WirePacket {
     pub wire_cube: UniqueWireCube,
     pub sequence: u64,
     pub epoch: u64,
+    pub ratchet_pub: [u8; 32],
     pub payload_mode: PayloadMode,
     pub packet_mac: [u8; 32],
 }
@@ -72,6 +74,7 @@ pub struct DeliveryAck {
     pub cube_fingerprint: [u8; FINGERPRINT_BYTES],
     pub sequence: u64,
     pub new_generation: u64,
+    pub next_ratchet_pub: [u8; 32],
     pub ack_mac: [u8; 32],
 }
 
@@ -101,6 +104,14 @@ pub struct MeshAuditStats {
 }
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
+struct DhRatchetState {
+    local_dh_secret: [u8; 32],
+    local_dh_pub: [u8; 32],
+    peer_dh_pub: [u8; 32],
+    chain_key: [u8; 32],
+}
+
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 struct PendingTransition {
     cube_fingerprint: [u8; FINGERPRINT_BYTES],
     next_sequence: u64,
@@ -109,10 +120,11 @@ struct PendingTransition {
     #[zeroize(skip)]
     born_coord: Coord3D,
     next_main_root: [u8; 32],
-    expected_ack_mac: [u8; 32],
+    ack_mac_key: [u8; 32],
+    dh_out: [u8; 32],
 }
 
-/// Synchronized 100-cube cellular cryptography mesh (`Section 5`).
+/// Synchronized 100-cube cellular cryptography mesh (`Section 5`) with per-message X25519 DH Ratchet.
 pub struct CellularMesh {
     config: MeshConfig,
     cubes: Vec<VoxelCube>,
@@ -120,6 +132,7 @@ pub struct CellularMesh {
     decoys: Vec<VoxelCube>,
     custody: ThreeCubeCustody,
     clock_guard: LocalClientClockGuard,
+    ratchet: DhRatchetState,
     epoch: u64,
     sequence: u64,
     pending_outbound: Option<PendingTransition>,
@@ -130,7 +143,8 @@ impl CellularMesh {
     ///
     /// Two peers calling `provision_device` with identical `config`, `custody`, and `shared_mesh_seed`,
     /// each binding to their own `HardwareProvider`, start synchronized while keeping hardware locks
-    /// strictly bound to their own physical devices.
+    /// strictly bound to their own physical devices. On the very first ACK/DH step, receiver keys
+    /// rotate to independent OS CSPRNG X25519 keypairs for Post-Compromise Security.
     pub fn provision_device(
         config: MeshConfig,
         custody: ThreeCubeCustody,
@@ -171,6 +185,12 @@ impl CellularMesh {
         let decoys = generate_decoy_cubes(&config, &decoy_seed, &cubes);
         root_cap.zeroize();
 
+        let init_dh_secret =
+            hmac_sha256_parts(shared_mesh_seed, &[b"init-dh-ratchet-sk", &custody.main.chain_id]);
+        let init_dh_pub = PublicKey::from(&StaticSecret::from(init_dh_secret)).to_bytes();
+        let init_chain_key =
+            hmac_sha256_parts(shared_mesh_seed, &[b"init-dh-chain", &custody.main.chain_id]);
+
         Ok(Self {
             config,
             cubes,
@@ -178,13 +198,20 @@ impl CellularMesh {
             decoys,
             custody,
             clock_guard,
+            ratchet: DhRatchetState {
+                local_dh_secret: init_dh_secret,
+                local_dh_pub: init_dh_pub,
+                peer_dh_pub: init_dh_pub,
+                chain_key: init_chain_key,
+            },
             epoch: 0,
             sequence: 0,
             pending_outbound: None,
         })
     }
 
-    /// Convenience helper creating a synchronized `(Alice, Bob)` mesh pair with distinct hardware enclaves.
+    /// Convenience helper creating a synchronized `(Alice -> Bob)` mesh pair with distinct hardware
+    /// enclaves and independent OS CSPRNG initial X25519 ratchet keys (zero shared DH private keys).
     pub fn new_paired(
         config: MeshConfig,
         custody: ThreeCubeCustody,
@@ -193,10 +220,53 @@ impl CellularMesh {
     ) -> Result<(Self, Self)> {
         let mut shared_mesh_seed = [0u8; 32];
         fill_random(&mut shared_mesh_seed)?;
-        let alice = Self::provision_device(config.clone(), custody.clone(), alice_hw, &shared_mesh_seed)?;
-        let bob = Self::provision_device(config, custody, bob_hw, &shared_mesh_seed)?;
+        let mut alice = Self::provision_device(config.clone(), custody.clone(), alice_hw, &shared_mesh_seed)?;
+        let mut bob = Self::provision_device(config, custody, bob_hw, &shared_mesh_seed)?;
         shared_mesh_seed.zeroize();
+
+        let (mut bob_sk, bob_pk) = Self::generate_dh_keypair()?;
+        let (mut alice_sk, alice_pk) = Self::generate_dh_keypair()?;
+        alice.set_local_dh_keypair(alice_sk, alice_pk)?;
+        alice.set_peer_dh_pub(bob_pk)?;
+        bob.set_local_dh_keypair(bob_sk, bob_pk)?;
+        bob.set_peer_dh_pub(alice_pk)?;
+        bob_sk.zeroize();
+        alice_sk.zeroize();
+
         Ok((alice, bob))
+    }
+
+    /// Returns this mesh's current local X25519 ratchet public key.
+    pub fn local_dh_pub(&self) -> [u8; 32] {
+        self.ratchet.local_dh_pub
+    }
+
+    /// Sets the peer's current X25519 ratchet public key after verifying it is non-zero.
+    pub fn set_peer_dh_pub(&mut self, peer_pub: [u8; 32]) -> Result<()> {
+        if constant_time_eq(&peer_pub, &[0u8; 32]) {
+            return Err(CubeHashError::InvalidConfig(
+                "peer ratchet public key cannot be all-zero",
+            ));
+        }
+        self.ratchet.peer_dh_pub = peer_pub;
+        Ok(())
+    }
+
+    /// Replaces the local X25519 ratchet secret/public keypair cleanly.
+    pub fn set_local_dh_keypair(
+        &mut self,
+        local_secret: [u8; 32],
+        local_pub: [u8; 32],
+    ) -> Result<()> {
+        if constant_time_eq(&local_pub, &[0u8; 32]) {
+            return Err(CubeHashError::InvalidConfig(
+                "local ratchet public key cannot be all-zero",
+            ));
+        }
+        self.ratchet.local_dh_secret.zeroize();
+        self.ratchet.local_dh_secret = local_secret;
+        self.ratchet.local_dh_pub = local_pub;
+        Ok(())
     }
 
     /// Sends compact critical data (up to `core_bytes - 8` = `24` bytes in standard config)
@@ -230,8 +300,8 @@ impl CellularMesh {
         self.begin_send_inner(hw, plaintext, false)
     }
 
-    /// Commits the staged cellular mutation (`25 select / 20 consume / 1 kill + 1 birth`) upon
-    /// receiving a valid [`DeliveryAck`] from the receiver (`Section 5`).
+    /// Commits the staged cellular mutation (`25 select / 20 consume / 1 kill + 1 birth`) and
+    /// advances the X25519 DH Ratchet upon receiving a valid [`DeliveryAck`] (`Section 5`).
     pub fn commit_ack(&mut self, hw: &dyn HardwareProvider, ack: &DeliveryAck) -> Result<()> {
         let _exec_token = self.clock_guard.authorize_local_execution(hw)?;
         let pending = self
@@ -239,16 +309,31 @@ impl CellularMesh {
             .as_ref()
             .ok_or(CubeHashError::NoPendingTransaction)?;
 
+        let expected_ack_mac = Self::compute_ack_mac(
+            &pending.ack_mac_key,
+            &ack.cube_fingerprint,
+            ack.sequence,
+            &ack.next_ratchet_pub,
+        );
         if !constant_time_eq(&pending.cube_fingerprint, &ack.cube_fingerprint)
             || pending.next_sequence != ack.sequence
             || pending.next_sequence != ack.new_generation
-            || !constant_time_eq(&pending.expected_ack_mac, &ack.ack_mac)
+            || constant_time_eq(&ack.next_ratchet_pub, &[0u8; 32])
+            || !constant_time_eq(&expected_ack_mac, &ack.ack_mac)
         {
             return Err(CubeHashError::AckMismatch);
         }
 
+        let next_peer_pub = ack.next_ratchet_pub;
         let committed = self.pending_outbound.take().unwrap();
+        let next_chain_key = Self::advance_ratchet_chain_key(
+            &self.ratchet.chain_key,
+            &committed.dh_out,
+            &next_peer_pub,
+        );
         self.apply_transition(committed);
+        self.ratchet.chain_key = next_chain_key;
+        self.ratchet.peer_dh_pub = next_peer_pub;
         Ok(())
     }
 
@@ -263,7 +348,8 @@ impl CellularMesh {
     }
 
     /// Authenticated receive path: verifies hardware lock, heals bit-rot in the wire cube via TMR
-    /// Majority Voting, verifies MAC, decrypts payload, commits `25/20/kill/birth`, and emits `DeliveryAck`.
+    /// Majority Voting, computes X25519 DH ratchet secret, verifies MAC, decrypts payload,
+    /// rotates receiver X25519 keypair, commits `25/20/kill/birth`, and emits `DeliveryAck`.
     pub fn receive_authenticated(
         &mut self,
         hw: &dyn HardwareProvider,
@@ -282,8 +368,18 @@ impl CellularMesh {
         }
 
         let mut root_cap = self.custody.derive_root_capability(self.config.fixed_step_budget);
+        let mut dh_out = match Self::dh_exchange(&self.ratchet.local_dh_secret, &packet.ratchet_pub)
+        {
+            Ok(s) => s,
+            Err(e) => {
+                root_cap.zeroize();
+                return Err(e);
+            }
+        };
+        let mut ratcheted_root =
+            Self::derive_ratcheted_root(&root_cap, &self.ratchet.chain_key, &dh_out);
         let algo = self.synthesize_ephemeral_algorithm(
-            &root_cap,
+            &ratcheted_root,
             &packet.wire_cube.cube_fingerprint,
             packet.sequence,
             packet.epoch,
@@ -302,105 +398,77 @@ impl CellularMesh {
             core_pattern: packet.wire_cube.partial_256b.clone(),
             weight_layer: Vec::new(),
         };
-        let heal_report = wire_voxel.heal_bitwise(&wire_tmr_key)?;
+        let heal_report = match wire_voxel.heal_bitwise(&wire_tmr_key) {
+            Ok(r) => r,
+            Err(e) => {
+                root_cap.zeroize();
+                ratcheted_root.zeroize();
+                dh_out.zeroize();
+                return Err(e);
+            }
+        };
         packet.wire_cube.partial_256b = wire_voxel.core_pattern.clone();
         packet.wire_cube.partial_1000b = wire_voxel.sub_matrix.clone();
 
-        // 2. Verify packet MAC over healed wire cube + sequence + epoch + ciphertext.
+        // 2. Verify packet MAC over healed wire cube + sequence + epoch + ratchet_pub + ciphertext.
         let expected_mac = Self::compute_packet_mac(
             &algo.algo_key,
             &packet.wire_cube.cube_fingerprint,
             packet.sequence,
             packet.epoch,
+            &packet.ratchet_pub,
             &packet.wire_cube.partial_256b,
             &packet.payload_mode,
         );
         if !constant_time_eq(&expected_mac, &packet.packet_mac) {
             root_cap.zeroize();
+            ratcheted_root.zeroize();
+            dh_out.zeroize();
             return Err(CubeHashError::AuthenticationFailed);
         }
 
         // 3. Unmask core_pattern and recover plaintext according to Dual Mode.
-        let mut core_mask = vec![0u8; self.config.core_bytes];
-        whitened_stream(&algo.algo_key, b"wire-core-mask", &mut core_mask);
-        let mut plain_core = vec![0u8; self.config.core_bytes];
-        for i in 0..self.config.core_bytes {
-            plain_core[i] = packet.wire_cube.partial_256b[i] ^ core_mask[i];
+        let (payload_ok, plaintext) =
+            self.decrypt_payload_uniform(&algo.algo_key, packet, &packet.wire_cube.partial_256b);
+        if payload_ok != 1 {
+            root_cap.zeroize();
+            ratcheted_root.zeroize();
+            dh_out.zeroize();
+            return Err(CubeHashError::AuthenticationFailed);
         }
-        core_mask.zeroize();
 
-        let plaintext = match &packet.payload_mode {
-            PayloadMode::RawCore256 => {
-                if plain_core[2] != CORE_FLAG_RAW {
-                    plain_core.zeroize();
-                    root_cap.zeroize();
-                    return Err(CubeHashError::AuthenticationFailed);
-                }
-                let len = u16::from_le_bytes([plain_core[0], plain_core[1]]) as usize;
-                if len > self.config.raw_core_payload_capacity() {
-                    plain_core.zeroize();
-                    root_cap.zeroize();
-                    return Err(CubeHashError::AuthenticationFailed);
-                }
-                let seq_tag = &plain_core[3..8];
-                let expected_tag = &hmac_sha256_parts(
-                    &algo.algo_key,
-                    &[b"raw-core-tag", &packet.sequence.to_le_bytes()],
-                )[..5];
-                if !constant_time_eq(seq_tag, expected_tag) {
-                    plain_core.zeroize();
-                    root_cap.zeroize();
-                    return Err(CubeHashError::AuthenticationFailed);
-                }
-                plain_core[8..8 + len].to_vec()
-            }
-            PayloadMode::ArbitraryCiphertext { ciphertext } => {
-                if plain_core[2] != CORE_FLAG_AEAD || plain_core.len() < 16 {
-                    plain_core.zeroize();
-                    root_cap.zeroize();
-                    return Err(CubeHashError::AuthenticationFailed);
-                }
-                let mut nonce = [0u8; 24];
-                hkdf_expand_label(
-                    &algo.algo_key,
-                    &plain_core[8..],
-                    b"cubehash-aead-nonce",
-                    &mut nonce,
-                )?;
-                let mut msg_key = [0u8; 32];
-                hkdf_expand_label(
-                    &algo.algo_key,
-                    &packet.wire_cube.cube_fingerprint,
-                    b"cubehash-aead-payload",
-                    &mut msg_key,
-                )?;
-                let aad = Self::build_aead_aad(
-                    &packet.wire_cube.cube_fingerprint,
-                    packet.sequence,
-                    packet.epoch,
-                );
-                let pt = aead_open(&msg_key, &nonce, &aad, ciphertext);
-                msg_key.zeroize();
-                plain_core.zeroize();
-                pt?
-            }
-        };
-
-        // 4. Stage and immediately commit the 25/20/kill/birth cellular transition on receiver.
+        // 4. Stage, rotate local X25519 ratchet keypair, commit cellular transition, and emit DeliveryAck.
+        let (mut next_dh_sk, next_dh_pub) = Self::generate_dh_keypair()?;
         let transition = self.build_transition(
             &root_cap,
             &algo,
             packet.wire_cube.cube_fingerprint,
             packet.sequence,
+            dh_out,
         )?;
         let ack = DeliveryAck {
             cube_fingerprint: packet.wire_cube.cube_fingerprint,
             sequence: packet.sequence,
             new_generation: packet.sequence,
-            ack_mac: transition.expected_ack_mac,
+            next_ratchet_pub: next_dh_pub,
+            ack_mac: Self::compute_ack_mac(
+                &transition.ack_mac_key,
+                &packet.wire_cube.cube_fingerprint,
+                packet.sequence,
+                &next_dh_pub,
+            ),
         };
-        self.apply_transition(transition);
+        self.commit_receive_transition(
+            transition,
+            next_dh_sk,
+            next_dh_pub,
+            packet.ratchet_pub,
+            &dh_out,
+        );
+        next_dh_sk.zeroize();
         root_cap.zeroize();
+        ratcheted_root.zeroize();
+        dh_out.zeroize();
 
         Ok((
             plaintext,
@@ -409,38 +477,179 @@ impl CellularMesh {
         ))
     }
 
-    /// Zero-oracle decryption entrypoint (`Section 4.2`):
-    /// - If hardware and packet are authentic, decrypts and advances state identically to `receive_authenticated`.
-    /// - On wrong key, wrong hardware, tampered payload, or unauthorized probe, completes a constant-budget
-    ///   decoy traversal and emits plausible [`ReceiveOutcome::HoneyDeception`] with ZERO error oracle
-    ///   and ZERO mutation of the real mesh!
+    /// Constant-work, zero-oracle decryption entrypoint (`Section 4.2`):
+    /// - Executes the full cryptographic evaluation, cellular transition dry-run, AND DTE decoy
+    ///   synthesis uniformly without early returns so authentic vs forged/unauthorized probes
+    ///   cannot be distinguished by timing or error side-channels.
+    /// - Mutates session state ONLY when all hardware, sequence, TMR, MAC, and AEAD checks pass.
     pub fn decrypt_zero_oracle(
         &mut self,
         hw: &dyn HardwareProvider,
         packet: &WirePacket,
         honey_profile: HoneyProfile,
     ) -> ReceiveOutcome {
-        // Clone probe safely so failed authentication leaves real mesh completely untampered.
-        let mut cloned_packet = packet.clone();
-        if let Ok((plaintext, ack, healed_bits)) = self.receive_authenticated(hw, &mut cloned_packet) {
-            return ReceiveOutcome::Authentic {
-                plaintext,
-                ack,
-                healed_bits,
+        let observed_hw = hw.device_hw_id();
+        let mut authentic_mask =
+            u8::from(constant_time_eq(&self.clock_guard.device_hw_id, &observed_hw));
+        let (unseal_ok, mut unsealed) = match hw
+            .unseal_secret(LocalClientClockGuard::SEAL_LABEL, &self.clock_guard.sealed_hw_secret)
+        {
+            Ok(u) => (1u8, u),
+            Err(_) => (0u8, [0u8; 32]),
+        };
+        authentic_mask &= unseal_ok;
+        let (tick_ok, candidate_tick) = match self.clock_guard.local_monotonic_tick.checked_add(1) {
+            Some(t) => (1u8, t),
+            None => (0u8, self.clock_guard.local_monotonic_tick),
+        };
+        authentic_mask &= tick_ok;
+        let _exec_token = hmac_sha256_parts(
+            &unsealed,
+            &[&self.clock_guard.device_hw_id, &candidate_tick.to_le_bytes()],
+        );
+        unsealed.zeroize();
+
+        let expected_seq = self.sequence.wrapping_add(1);
+        authentic_mask &= u8::from(packet.epoch == self.epoch)
+            & u8::from(packet.sequence == expected_seq)
+            & u8::from(packet.wire_cube.partial_256b.len() == self.config.core_bytes)
+            & u8::from(packet.wire_cube.partial_1000b.len() == self.config.sub_matrix_bytes);
+
+        let mut norm_256b = vec![0u8; self.config.core_bytes];
+        let c_copy = packet
+            .wire_cube
+            .partial_256b
+            .len()
+            .min(self.config.core_bytes);
+        norm_256b[..c_copy].copy_from_slice(&packet.wire_cube.partial_256b[..c_copy]);
+
+        let mut norm_1000b = vec![0u8; self.config.sub_matrix_bytes];
+        let s_copy = packet
+            .wire_cube
+            .partial_1000b
+            .len()
+            .min(self.config.sub_matrix_bytes);
+        norm_1000b[..s_copy].copy_from_slice(&packet.wire_cube.partial_1000b[..s_copy]);
+
+        let mut root_cap = self.custody.derive_root_capability(self.config.fixed_step_budget);
+        let (dh_ok, mut dh_out) =
+            match Self::dh_exchange(&self.ratchet.local_dh_secret, &packet.ratchet_pub) {
+                Ok(s) => (1u8, s),
+                Err(_) => (0u8, [0u8; 32]),
             };
-        }
+        authentic_mask &= dh_ok;
 
-        let mut probe = Vec::with_capacity(64);
+        let mut ratcheted_root =
+            Self::derive_ratcheted_root(&root_cap, &self.ratchet.chain_key, &dh_out);
+        let algo = self.synthesize_ephemeral_algorithm(
+            &ratcheted_root,
+            &packet.wire_cube.cube_fingerprint,
+            packet.sequence,
+            packet.epoch,
+        );
+
+        let wire_tmr_key = Self::derive_wire_tmr_key(
+            &algo.algo_key,
+            &packet.wire_cube.cube_fingerprint,
+            packet.sequence,
+        );
+        let mut wire_voxel = VoxelCube {
+            cube_uid: packet.wire_cube.cube_fingerprint,
+            generation: packet.sequence,
+            sub_matrix: norm_1000b,
+            core_pattern: norm_256b,
+            weight_layer: Vec::new(),
+        };
+        let (tmr_ok, healed_bits) = match wire_voxel.heal_bitwise(&wire_tmr_key) {
+            Ok(r) => (1u8, r.repaired_core_bits + r.repaired_shadow_bits),
+            Err(_) => (0u8, 0usize),
+        };
+        authentic_mask &= tmr_ok;
+
+        let expected_mac = Self::compute_packet_mac(
+            &algo.algo_key,
+            &packet.wire_cube.cube_fingerprint,
+            packet.sequence,
+            packet.epoch,
+            &packet.ratchet_pub,
+            &wire_voxel.core_pattern,
+            &packet.payload_mode,
+        );
+        authentic_mask &= u8::from(constant_time_eq(&expected_mac, &packet.packet_mac));
+
+        let (payload_ok, mut plaintext) =
+            self.decrypt_payload_uniform(&algo.algo_key, packet, &wire_voxel.core_pattern);
+        authentic_mask &= payload_ok;
+
+        let transition_res = self.build_transition(
+            &root_cap,
+            &algo,
+            packet.wire_cube.cube_fingerprint,
+            packet.sequence,
+            dh_out,
+        );
+        let (next_dh_ok, mut next_dh_sk, next_dh_pub) = match Self::generate_dh_keypair() {
+            Ok((sk, pk)) => (1u8, sk, pk),
+            Err(_) => (0u8, [0u8; 32], [0u8; 32]),
+        };
+        authentic_mask &= next_dh_ok;
+
+        let mut probe = Vec::with_capacity(self.config.core_bytes + FINGERPRINT_BYTES + 8);
         probe.extend_from_slice(&packet.wire_cube.cube_fingerprint);
-        probe.extend_from_slice(&packet.wire_cube.partial_256b);
+        probe.extend_from_slice(&wire_voxel.core_pattern);
         probe.extend_from_slice(&packet.sequence.to_le_bytes());
-
-        let plausible_output =
+        let mut plausible_output =
             DteEngine::synthesize_honey_output(&self.config, honey_profile, &probe, &self.decoys);
-        ReceiveOutcome::HoneyDeception {
-            plausible_output,
-            profile: honey_profile,
-        }
+        probe.zeroize();
+
+        let outcome = if authentic_mask == 1 {
+            if let Ok(transition) = transition_res {
+                let ack = DeliveryAck {
+                    cube_fingerprint: packet.wire_cube.cube_fingerprint,
+                    sequence: packet.sequence,
+                    new_generation: packet.sequence,
+                    next_ratchet_pub: next_dh_pub,
+                    ack_mac: Self::compute_ack_mac(
+                        &transition.ack_mac_key,
+                        &packet.wire_cube.cube_fingerprint,
+                        packet.sequence,
+                        &next_dh_pub,
+                    ),
+                };
+                self.clock_guard.local_monotonic_tick = candidate_tick;
+                self.commit_receive_transition(
+                    transition,
+                    next_dh_sk,
+                    next_dh_pub,
+                    packet.ratchet_pub,
+                    &dh_out,
+                );
+                plausible_output.zeroize();
+                ReceiveOutcome::Authentic {
+                    plaintext,
+                    ack,
+                    healed_bits,
+                }
+            } else {
+                plaintext.zeroize();
+                ReceiveOutcome::HoneyDeception {
+                    plausible_output,
+                    profile: honey_profile,
+                }
+            }
+        } else {
+            plaintext.zeroize();
+            ReceiveOutcome::HoneyDeception {
+                plausible_output,
+                profile: honey_profile,
+            }
+        };
+
+        next_dh_sk.zeroize();
+        root_cap.zeroize();
+        ratcheted_root.zeroize();
+        dh_out.zeroize();
+        outcome
     }
 
     /// Executes Bijective Epoch Hopping (`Section 4.1`):
@@ -451,7 +660,46 @@ impl CellularMesh {
         if self.pending_outbound.is_some() {
             return Err(CubeHashError::PendingTransactionExists);
         }
+        self.apply_epoch_hop_internal()
+    }
 
+    /// Executes Bijective Epoch Hopping on a TX mesh AND steps the X25519 DH Ratchet forward,
+    /// returning `(new_epoch, epoch_eph_pub)` for authenticated delivery to the receiver.
+    pub fn hop_epoch_ratchet_tx(&mut self, hw: &dyn HardwareProvider) -> Result<(u64, [u8; 32])> {
+        let _exec_token = self.clock_guard.authorize_local_execution(hw)?;
+        if self.pending_outbound.is_some() {
+            return Err(CubeHashError::PendingTransactionExists);
+        }
+        let (mut eph_sk, eph_pub) = Self::generate_dh_keypair()?;
+        let mut dh_out = Self::dh_exchange(&eph_sk, &self.ratchet.peer_dh_pub)?;
+        eph_sk.zeroize();
+        let new_epoch = self.apply_epoch_hop_internal()?;
+        self.ratchet.chain_key =
+            Self::advance_ratchet_chain_key(&self.ratchet.chain_key, &dh_out, &eph_pub);
+        dh_out.zeroize();
+        Ok((new_epoch, eph_pub))
+    }
+
+    /// Advances an RX mesh to `target_epoch` and folds the sender's `epoch_eph_pub` into its DH ratchet.
+    pub fn hop_epoch_ratchet_rx(
+        &mut self,
+        hw: &dyn HardwareProvider,
+        target_epoch: u64,
+        epoch_eph_pub: [u8; 32],
+    ) -> Result<u64> {
+        let _exec_token = self.clock_guard.authorize_local_execution(hw)?;
+        if target_epoch != self.epoch + 1 {
+            return Err(CubeHashError::ReplayDetected);
+        }
+        let mut dh_out = Self::dh_exchange(&self.ratchet.local_dh_secret, &epoch_eph_pub)?;
+        let new_epoch = self.apply_epoch_hop_internal()?;
+        self.ratchet.chain_key =
+            Self::advance_ratchet_chain_key(&self.ratchet.chain_key, &dh_out, &epoch_eph_pub);
+        dh_out.zeroize();
+        Ok(new_epoch)
+    }
+
+    fn apply_epoch_hop_internal(&mut self) -> Result<u64> {
         let mut root_cap = self.custody.derive_root_capability(self.config.fixed_step_budget);
         let prev_epoch = self.epoch;
         let next_epoch = prev_epoch + 1;
@@ -599,9 +847,25 @@ impl CellularMesh {
         let mut cube_fingerprint = [0u8; FINGERPRINT_BYTES];
         fill_random(&mut cube_fingerprint)?;
 
+        let (mut eph_sk, ratchet_pub) = Self::generate_dh_keypair()?;
+        let mut dh_out = match Self::dh_exchange(&eph_sk, &self.ratchet.peer_dh_pub) {
+            Ok(s) => s,
+            Err(e) => {
+                eph_sk.zeroize();
+                return Err(e);
+            }
+        };
+        eph_sk.zeroize();
+
         let mut root_cap = self.custody.derive_root_capability(self.config.fixed_step_budget);
-        let algo =
-            self.synthesize_ephemeral_algorithm(&root_cap, &cube_fingerprint, next_seq, self.epoch);
+        let mut ratcheted_root =
+            Self::derive_ratcheted_root(&root_cap, &self.ratchet.chain_key, &dh_out);
+        let algo = self.synthesize_ephemeral_algorithm(
+            &ratcheted_root,
+            &cube_fingerprint,
+            next_seq,
+            self.epoch,
+        );
 
         let mut plain_core = vec![0u8; self.config.core_bytes];
         fill_random(&mut plain_core)?;
@@ -633,7 +897,7 @@ impl CellularMesh {
                 b"cubehash-aead-payload",
                 &mut msg_key,
             )?;
-            let aad = Self::build_aead_aad(&cube_fingerprint, next_seq, self.epoch);
+            let aad = Self::build_aead_aad(&cube_fingerprint, next_seq, self.epoch, &ratchet_pub);
             let ciphertext = aead_seal(&msg_key, &nonce, &aad, payload)?;
             msg_key.zeroize();
             PayloadMode::ArbitraryCiphertext { ciphertext }
@@ -662,13 +926,16 @@ impl CellularMesh {
             &cube_fingerprint,
             next_seq,
             self.epoch,
+            &ratchet_pub,
             &partial_256b,
             &payload_mode,
         );
 
-        let pending = self.build_transition(&root_cap, &algo, cube_fingerprint, next_seq)?;
+        let pending = self.build_transition(&root_cap, &algo, cube_fingerprint, next_seq, dh_out)?;
         self.pending_outbound = Some(pending);
         root_cap.zeroize();
+        ratcheted_root.zeroize();
+        dh_out.zeroize();
 
         Ok(WirePacket {
             wire_cube: UniqueWireCube {
@@ -679,20 +946,88 @@ impl CellularMesh {
             },
             sequence: next_seq,
             epoch: self.epoch,
+            ratchet_pub,
             payload_mode,
             packet_mac,
         })
     }
 
+    fn decrypt_payload_uniform(
+        &self,
+        algo_key: &[u8; 32],
+        packet: &WirePacket,
+        healed_core: &[u8],
+    ) -> (u8, Vec<u8>) {
+        let fingerprint = &packet.wire_cube.cube_fingerprint;
+        let sequence = packet.sequence;
+        let epoch = packet.epoch;
+        let ratchet_pub = &packet.ratchet_pub;
+        let payload_mode = &packet.payload_mode;
+
+        let mut core_mask = vec![0u8; self.config.core_bytes];
+        whitened_stream(algo_key, b"wire-core-mask", &mut core_mask);
+        let mut plain_core = vec![0u8; self.config.core_bytes];
+        for i in 0..self.config.core_bytes {
+            plain_core[i] = healed_core[i] ^ core_mask[i];
+        }
+        core_mask.zeroize();
+
+        let result = match payload_mode {
+            PayloadMode::RawCore256 => {
+                let flag_ok = u8::from(plain_core[2] == CORE_FLAG_RAW);
+                let len = u16::from_le_bytes([plain_core[0], plain_core[1]]) as usize;
+                let cap = self.config.raw_core_payload_capacity();
+                let len_ok = u8::from(len <= cap);
+                let expected_tag =
+                    hmac_sha256_parts(algo_key, &[b"raw-core-tag", &sequence.to_le_bytes()]);
+                let tag_ok = u8::from(constant_time_eq(&plain_core[3..8], &expected_tag[..5]));
+                let ok = flag_ok & len_ok & tag_ok;
+                let safe_len = len.min(cap).min(plain_core.len().saturating_sub(8));
+                let pt = if ok == 1 {
+                    plain_core[8..8 + safe_len].to_vec()
+                } else {
+                    Vec::new()
+                };
+                (ok, pt)
+            }
+            PayloadMode::ArbitraryCiphertext { ciphertext } => {
+                let flag_ok = u8::from(plain_core[2] == CORE_FLAG_AEAD && plain_core.len() >= 16);
+                let mut nonce = [0u8; 24];
+                let mut msg_key = [0u8; 32];
+                let kdf_ok = u8::from(
+                    hkdf_expand_label(algo_key, &plain_core[8..], b"cubehash-aead-nonce", &mut nonce)
+                        .is_ok()
+                        && hkdf_expand_label(
+                            algo_key,
+                            fingerprint,
+                            b"cubehash-aead-payload",
+                            &mut msg_key,
+                        )
+                        .is_ok(),
+                );
+                let aad = Self::build_aead_aad(fingerprint, sequence, epoch, ratchet_pub);
+                let aead_res = aead_open(&msg_key, &nonce, &aad, ciphertext);
+                msg_key.zeroize();
+                match aead_res {
+                    Ok(pt) => (flag_ok & kdf_ok, pt),
+                    Err(_) => (0u8, Vec::new()),
+                }
+            }
+        };
+
+        plain_core.zeroize();
+        result
+    }
+
     fn synthesize_ephemeral_algorithm(
         &self,
-        root_cap: &[u8; 32],
+        ratcheted_root: &[u8; 32],
         fingerprint: &[u8; FINGERPRINT_BYTES],
         sequence: u64,
         epoch: u64,
     ) -> EphemeralCubeAlgorithm {
         let sel_seed = hmac_sha256_parts(
-            root_cap,
+            ratcheted_root,
             &[
                 b"quorum-select",
                 &self.custody.auditor.synthesis_salt,
@@ -727,7 +1062,7 @@ impl CellularMesh {
 
         let algo_key = fixed_budget_mix(
             self.custody.auditor.time_algorithm,
-            root_cap,
+            ratcheted_root,
             b"ephemeral-algo-synthesis",
             &quorum_material,
             self.config.fixed_step_budget,
@@ -760,6 +1095,7 @@ impl CellularMesh {
         algo: &EphemeralCubeAlgorithm,
         fingerprint: [u8; FINGERPRINT_BYTES],
         next_sequence: u64,
+        dh_out: [u8; 32],
     ) -> Result<PendingTransition> {
         let consume_count = self.config.consume_for_next;
         let consumed_slices: Vec<&[u8]> = algo.selected_indices[..consume_count]
@@ -796,10 +1132,7 @@ impl CellularMesh {
             &algo.algo_key,
             &[b"next-main-root", &self.custody.main.active_chain_state, &next_seed],
         );
-        let expected_ack_mac = hmac_sha256_parts(
-            &algo.algo_key,
-            &[b"delivery-ack", &fingerprint, &next_sequence.to_le_bytes()],
-        );
+        let ack_mac_key = hmac_sha256_parts(&algo.algo_key, &[b"delivery-ack-key-v2"]);
         next_seed.zeroize();
 
         Ok(PendingTransition {
@@ -809,7 +1142,8 @@ impl CellularMesh {
             born_cube,
             born_coord,
             next_main_root,
-            expected_ack_mac,
+            ack_mac_key,
+            dh_out,
         })
     }
 
@@ -820,6 +1154,69 @@ impl CellularMesh {
         self.custody.main.generation = t.next_sequence;
         self.sequence = t.next_sequence;
         t.born_cube.zeroize();
+    }
+
+    fn commit_receive_transition(
+        &mut self,
+        t: PendingTransition,
+        next_local_sk: [u8; 32],
+        next_local_pub: [u8; 32],
+        sender_ratchet_pub: [u8; 32],
+        dh_out: &[u8; 32],
+    ) {
+        self.apply_transition(t);
+        self.ratchet.chain_key =
+            Self::advance_ratchet_chain_key(&self.ratchet.chain_key, dh_out, &next_local_pub);
+        self.ratchet.local_dh_secret.zeroize();
+        self.ratchet.local_dh_secret = next_local_sk;
+        self.ratchet.local_dh_pub = next_local_pub;
+        self.ratchet.peer_dh_pub = sender_ratchet_pub;
+    }
+
+    fn generate_dh_keypair() -> Result<([u8; 32], [u8; 32])> {
+        let mut sk_bytes = [0u8; 32];
+        fill_random(&mut sk_bytes)?;
+        let secret = StaticSecret::from(sk_bytes);
+        let pub_bytes = PublicKey::from(&secret).to_bytes();
+        Ok((sk_bytes, pub_bytes))
+    }
+
+    fn dh_exchange(secret_bytes: &[u8; 32], peer_pub_bytes: &[u8; 32]) -> Result<[u8; 32]> {
+        let sk = StaticSecret::from(*secret_bytes);
+        let pk = PublicKey::from(*peer_pub_bytes);
+        let shared = sk.diffie_hellman(&pk);
+        if !shared.was_contributory() {
+            return Err(CubeHashError::AuthenticationFailed);
+        }
+        Ok(shared.to_bytes())
+    }
+
+    fn derive_ratcheted_root(
+        root_cap: &[u8; 32],
+        chain_key: &[u8; 32],
+        dh_out: &[u8; 32],
+    ) -> [u8; 32] {
+        hmac_sha256_parts(root_cap, &[b"dh-ratchet-root-v1", chain_key, dh_out])
+    }
+
+    fn advance_ratchet_chain_key(
+        chain_key: &[u8; 32],
+        dh_out: &[u8; 32],
+        next_pub: &[u8; 32],
+    ) -> [u8; 32] {
+        hmac_sha256_parts(chain_key, &[b"dh-ratchet-chain-v1", dh_out, next_pub])
+    }
+
+    fn compute_ack_mac(
+        ack_mac_key: &[u8; 32],
+        fingerprint: &[u8; FINGERPRINT_BYTES],
+        seq: u64,
+        next_ratchet_pub: &[u8; 32],
+    ) -> [u8; 32] {
+        hmac_sha256_parts(
+            ack_mac_key,
+            &[b"delivery-ack-v2", fingerprint, &seq.to_le_bytes(), next_ratchet_pub],
+        )
     }
 
     fn derive_epoch_key(root_cap: &[u8; 32], chain_id: &[u8; 16], epoch: u64) -> [u8; 32] {
@@ -834,11 +1231,17 @@ impl CellularMesh {
         hmac_sha256_parts(algo_key, &[b"wire-tmr", fingerprint, &seq.to_le_bytes()])
     }
 
-    fn build_aead_aad(fingerprint: &[u8; FINGERPRINT_BYTES], seq: u64, epoch: u64) -> [u8; 32] {
-        let mut aad = [0u8; 32];
+    fn build_aead_aad(
+        fingerprint: &[u8; FINGERPRINT_BYTES],
+        seq: u64,
+        epoch: u64,
+        ratchet_pub: &[u8; 32],
+    ) -> [u8; 64] {
+        let mut aad = [0u8; 64];
         aad[..16].copy_from_slice(fingerprint);
         aad[16..24].copy_from_slice(&seq.to_le_bytes());
         aad[24..32].copy_from_slice(&epoch.to_le_bytes());
+        aad[32..64].copy_from_slice(ratchet_pub);
         aad
     }
 
@@ -847,6 +1250,7 @@ impl CellularMesh {
         fingerprint: &[u8; FINGERPRINT_BYTES],
         seq: u64,
         epoch: u64,
+        ratchet_pub: &[u8; 32],
         partial_256b: &[u8],
         payload_mode: &PayloadMode,
     ) -> [u8; 32] {
@@ -854,20 +1258,22 @@ impl CellularMesh {
             PayloadMode::RawCore256 => hmac_sha256_parts(
                 algo_key,
                 &[
-                    b"wire-mac-raw",
+                    b"wire-mac-raw-v2",
                     fingerprint,
                     &seq.to_le_bytes(),
                     &epoch.to_le_bytes(),
+                    ratchet_pub,
                     partial_256b,
                 ],
             ),
             PayloadMode::ArbitraryCiphertext { ciphertext } => hmac_sha256_parts(
                 algo_key,
                 &[
-                    b"wire-mac-aead",
+                    b"wire-mac-aead-v2",
                     fingerprint,
                     &seq.to_le_bytes(),
                     &epoch.to_le_bytes(),
+                    ratchet_pub,
                     partial_256b,
                     ciphertext,
                 ],
@@ -943,6 +1349,21 @@ impl DuplexCubeSession {
         honey_profile: HoneyProfile,
     ) -> ReceiveOutcome {
         self.rx.decrypt_zero_oracle(hw, packet, honey_profile)
+    }
+
+    /// Executes epoch hop + TX DH ratchet advancement.
+    pub fn hop_epoch_tx_ratchet(&mut self, hw: &dyn HardwareProvider) -> Result<(u64, [u8; 32])> {
+        self.tx.hop_epoch_ratchet_tx(hw)
+    }
+
+    /// Synchronizes RX epoch hop + folds sender's epoch DH ratchet key.
+    pub fn hop_epoch_rx_ratchet(
+        &mut self,
+        hw: &dyn HardwareProvider,
+        target_epoch: u64,
+        epoch_eph_pub: [u8; 32],
+    ) -> Result<u64> {
+        self.rx.hop_epoch_ratchet_rx(hw, target_epoch, epoch_eph_pub)
     }
 }
 

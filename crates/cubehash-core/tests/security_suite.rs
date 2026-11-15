@@ -565,3 +565,125 @@ fn test_os_hardware_provider_and_all_time_algorithms() {
         alice.commit_ack(&alice_hw, &ack).unwrap();
     }
 }
+
+#[test]
+fn test_dh_ratchet_forward_post_compromise_and_tamper_resistance() {
+    let cfg = MeshConfig::standard();
+    let custody = make_custody(&cfg);
+    let alice_hw = VirtualHardwareEnclave::random().unwrap();
+    let bob_hw = VirtualHardwareEnclave::random().unwrap();
+    let (mut alice, mut bob) =
+        CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
+
+    // Independent X25519 keys on Alice and Bob from genesis
+    assert_ne!(alice.local_dh_pub(), bob.local_dh_pub());
+
+    let mut pkt1 = alice.begin_send_message(&alice_hw, b"msg-one").unwrap();
+    let rpub1 = pkt1.ratchet_pub;
+    let (_, ack1, _) = bob.receive_authenticated(&bob_hw, &mut pkt1).unwrap();
+    let bob_pub_after_1 = ack1.next_ratchet_pub;
+    assert_eq!(bob.local_dh_pub(), bob_pub_after_1);
+    alice.commit_ack(&alice_hw, &ack1).unwrap();
+
+    // Next packet uses Bob's rotated public key and Alice generates a brand-new ephemeral X25519 key
+    let mut pkt2 = alice.begin_send_message(&alice_hw, b"msg-two").unwrap();
+    assert_ne!(pkt2.ratchet_pub, rpub1);
+
+    // Tampering with WirePacket.ratchet_pub alters algo_key -> wire TMR rejects and zero-oracle emits Honey
+    let mut bad_rpub_pkt = pkt2.clone();
+    bad_rpub_pkt.ratchet_pub[0] ^= 0xFF;
+    assert_eq!(
+        bob.receive_authenticated(&bob_hw, &mut bad_rpub_pkt),
+        Err(CubeHashError::UnrecoverableCorruption)
+    );
+    assert!(matches!(
+        bob.decrypt_zero_oracle(&bob_hw, &bad_rpub_pkt, HoneyProfile::ChatPlaintext),
+        ReceiveOutcome::HoneyDeception { .. }
+    ));
+
+    // Non-contributory all-zero ratchet_pub fails cleanly
+    let mut zero_rpub_pkt = pkt2.clone();
+    zero_rpub_pkt.ratchet_pub = [0u8; 32];
+    assert_eq!(
+        bob.receive_authenticated(&bob_hw, &mut zero_rpub_pkt),
+        Err(CubeHashError::AuthenticationFailed)
+    );
+
+    let (pt2, mut ack2, _) = bob.receive_authenticated(&bob_hw, &mut pkt2).unwrap();
+    assert_eq!(pt2, b"msg-two");
+    assert_ne!(ack2.next_ratchet_pub, bob_pub_after_1);
+
+    // Tampering with DeliveryAck.next_ratchet_pub fails ACK MAC verification cleanly
+    ack2.next_ratchet_pub[3] ^= 0x01;
+    assert_eq!(
+        alice.commit_ack(&alice_hw, &ack2),
+        Err(CubeHashError::AckMismatch)
+    );
+    ack2.next_ratchet_pub[3] ^= 0x01;
+    alice.commit_ack(&alice_hw, &ack2).unwrap();
+
+    // Synchronized DH-ratcheted Epoch Hop rotates both sides forward without breaking sync
+    let (new_ep, epoch_pub) = alice.hop_epoch_ratchet_tx(&alice_hw).unwrap();
+    assert_eq!(new_ep, 1);
+    assert_eq!(
+        bob.hop_epoch_ratchet_rx(&bob_hw, new_ep, epoch_pub).unwrap(),
+        1
+    );
+
+    let mut pkt3 = alice.begin_send_message(&alice_hw, b"post-dh-epoch").unwrap();
+    let (pt3, ack3, _) = bob.receive_authenticated(&bob_hw, &mut pkt3).unwrap();
+    assert_eq!(pt3, b"post-dh-epoch");
+    alice.commit_ack(&alice_hw, &ack3).unwrap();
+}
+
+#[test]
+fn test_zero_oracle_constant_work_never_mutates_on_any_failure() {
+    let cfg = MeshConfig::standard();
+    let custody = make_custody(&cfg);
+    let alice_hw = VirtualHardwareEnclave::random().unwrap();
+    let bob_hw = VirtualHardwareEnclave::random().unwrap();
+    let attacker_hw = VirtualHardwareEnclave::random().unwrap();
+    let (mut alice, mut bob) =
+        CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
+
+    let pkt = alice.begin_send_message(&alice_hw, b"sensitive-payload").unwrap();
+    let tick_before = bob.clock_guard_mut().local_monotonic_tick;
+    let dh_before = bob.local_dh_pub();
+
+    // 1. Malformed wire dimensions probe
+    let mut bad_dim = pkt.clone();
+    bad_dim.wire_cube.partial_256b.truncate(5);
+    assert!(matches!(
+        bob.decrypt_zero_oracle(&bob_hw, &bad_dim, HoneyProfile::Bip39ChecksumPhrase),
+        ReceiveOutcome::HoneyDeception { .. }
+    ));
+
+    // 2. Wrong hardware probe
+    assert!(matches!(
+        bob.decrypt_zero_oracle(&attacker_hw, &pkt, HoneyProfile::ChatPlaintext),
+        ReceiveOutcome::HoneyDeception { .. }
+    ));
+
+    // 3. Stale sequence probe
+    let mut wrong_seq = pkt.clone();
+    wrong_seq.sequence = 99;
+    assert!(matches!(
+        bob.decrypt_zero_oracle(&bob_hw, &wrong_seq, HoneyProfile::RawUniform { len: 32 }),
+        ReceiveOutcome::HoneyDeception { .. }
+    ));
+
+    // Verify ZERO state mutation (not even monotonic clock tick!) after all probes
+    assert_eq!(bob.clock_guard_mut().local_monotonic_tick, tick_before);
+    assert_eq!(bob.local_dh_pub(), dh_before);
+    assert_eq!(bob.sequence(), 0);
+
+    // Authentic decrypt still works seamlessly
+    match bob.decrypt_zero_oracle(&bob_hw, &pkt, HoneyProfile::ChatPlaintext) {
+        ReceiveOutcome::Authentic { plaintext, ack, .. } => {
+            assert_eq!(plaintext, b"sensitive-payload");
+            assert_eq!(bob.clock_guard_mut().local_monotonic_tick, tick_before + 1);
+            alice.commit_ack(&alice_hw, &ack).unwrap();
+        }
+        ReceiveOutcome::HoneyDeception { .. } => panic!("authentic packet rejected"),
+    }
+}
