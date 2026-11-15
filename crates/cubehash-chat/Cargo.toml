@@ -1,0 +1,23 @@
+[package]
+name = "cubehash-chat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Zero-knowledge WebSocket relay server and hardware-bound CubeHash chat client with Web UI and CLI"
+
+[dependencies]
+axum.workspace = true
+cubehash-core = { path = "../cubehash-core" }
+futures-util.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true

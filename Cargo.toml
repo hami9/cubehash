@@ -4,6 +4,7 @@ members = [
     "crates/cubehash-core",
     "crates/cubehash-ffi",
     "crates/cubehash-cli",
+    "crates/cubehash-chat",
 ]
 
 [workspace.package]
@@ -14,8 +15,10 @@ authors = ["CubeHash Authors"]
 description = "General-purpose hierarchical, self-healing, hardware-bound cellular cube cryptography engine"
 
 [workspace.dependencies]
+axum = { version = "0.8", features = ["ws"] }
 blake2 = "0.10"
 chacha20poly1305 = "0.10"
+futures-util = "0.3"
 getrandom = "0.2"
 hex = "0.4"
 hkdf = "0.12"
@@ -27,4 +30,7 @@ sha2 = "0.10"
 sha3 = "0.10"
 subtle = "2.6"
 thiserror = "2.0"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.26"
+x25519-dalek = { version = "2.0", features = ["static_secrets", "zeroize"] }
 zeroize = { version = "1.8", features = ["derive"] }

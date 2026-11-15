@@ -13,11 +13,12 @@ Standalone, general-purpose hierarchical, self-healing, hardware-bound cellular 
   - **100-Cube Cellular Mesh & Dual Payload Mode** (`src/mesh.rs`): arrival-triggered `25 select / 20 consume / 1 kill + 1 birth` lifecycle with `ACK / Rollback`, `RawCore256` (~173-byte base wire cube) and `ArbitraryCiphertext` (`XChaCha20-Poly1305` via cube-synthesized ephemeral key), plus `DuplexCubeSession` for full-duplex chat/IPC.
 - `crates/cubehash-ffi`: `cdylib` / `staticlib` C-ABI bindings and `include/cubehash.h`.
 - `crates/cubehash-cli`: security audit, fault-injection, and throughput benchmark runner.
+- `crates/cubehash-chat`: zero-knowledge WebSocket blind relay server (`relay`, zero keys/plaintext, live inspector UI) and hardware-bound client node (`client`) with X25519 + optional PIN pairing, local browser Web UI (`--web`), and interactive terminal chat (`--cli`).
 
 ## Commands
 
 ```bash
-# Run full security & FFI test suite
+# Run full security, FFI, and E2E chat test suite
 cargo test --workspace
 
 # Lint workspace cleanly
@@ -28,4 +29,9 @@ cargo run --release -p cubehash-cli
 
 # Build C-ABI shared/static library (target/release/cubehash_ffi.dll / .so / .lib)
 cargo build --release -p cubehash-ffi
+
+# Run Blind Relay Server + Two Local Web UI / CLI Chat Clients
+cargo run -p cubehash-chat -- relay --listen 127.0.0.1:9000
+cargo run -p cubehash-chat -- client --id alice --relay ws://127.0.0.1:9000/ws --web 127.0.0.1:8081 --cli
+cargo run -p cubehash-chat -- client --id bob   --relay ws://127.0.0.1:9000/ws --web 127.0.0.1:8082 --cli
 ```
