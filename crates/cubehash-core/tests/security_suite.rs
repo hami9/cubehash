@@ -1032,8 +1032,8 @@ fn test_two_tier_high_throughput_ratchet_and_forward_secrecy() {
 
         // Corrupt 40 bits on intermediate symmetric frames too -> TMR must still self-heal
         if seq == 5 {
-            for i in 0..5 {
-                pkt.wire_cube.partial_256b[i] ^= 0xFF;
+            for b in &mut pkt.wire_cube.partial_256b[..5] {
+                *b ^= 0xFF;
             }
         }
 
