@@ -2,7 +2,10 @@
 
 **CubeHash** is a standalone, general-purpose cryptographic engine implemented in pure Rust (`#![forbid(unsafe_code)]` in the core crate) with a C/C++ ABI (`cubehash-ffi`) and a built-in adversarial audit & benchmark CLI (`cubehash-cli`).
 
-> This repository contains **strictly the CubeHash algorithm, FFI bindings, and its verification/audit suite** — no chat server, UI, or transport application code.
+> **Release `v1.0.1`** (`MIT OR Apache-2.0`) — This repository contains **strictly the CubeHash algorithm, FFI bindings, and its verification/audit suite** — no chat server, UI, or transport application code.
+
+[![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-teal.svg)](LICENSE-MIT)
+[![Rust: #![forbid(unsafe_code)]](https://img.shields.io/badge/cubehash--core-forbid(unsafe__code)-brightgreen.svg)](crates/cubehash-core/src/lib.rs)
 
 ---
 
@@ -19,6 +22,9 @@ Further deep dives:
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — Module anatomy, state machine, rollback atomicity, and C ABI surface
 - [docs/MATHEMATICS.md](docs/MATHEMATICS.md) — Formal mathematical specification, proofs of invertibility, and exact key schedule
 - [docs/VERIFICATION.md](docs/VERIFICATION.md) — Complete test matrix (`15` integration tests) and verified release benchmark output
+- [CHANGELOG.md](CHANGELOG.md) — Release history (`v1.0.1`)
+- [SECURITY.md](SECURITY.md) — Vulnerability disclosure policy & cryptographic scope
+- [CONTRIBUTING.md](CONTRIBUTING.md) — Pull request rules, CI requirements & contribution workflow
 
 ---
 
@@ -127,18 +133,35 @@ On `hop_epoch` (or `hop_epoch_ratchet_tx` / `hop_epoch_ratchet_rx`), every real 
 
 > Full proofs, key schedules, and equations are in **[docs/MATHEMATICS.md](docs/MATHEMATICS.md)**.
 
-- **3-Cube Capability Synthesis:**
-  $$K_{\text{root}} = \text{FixedBudgetMix}\Big(\text{Algo},\; \text{HMAC}(K_{\text{mother}}, \text{"3cube-root"} \| S_{\text{owner}} \| \text{chain\_id}),\; P_{\text{main}} \| S_{\text{synth}} \| K_{\text{auditor}}\Big)$$
-- **Ratcheted Ephemeral Key Derivation:**
-  $$K_{\text{ratchet}} = \text{HMAC}(K_{\text{root}}, \text{"dh-ratchet-root-v1"} \| K_{\text{chain}} \| \text{X25519}(sk, pk_{\text{peer}}))$$
-- **Bitwise Majority Voting (TMR):** For primary byte $C_i$ and unmasked shadow copies $A_i = S_i \oplus M_{A,i}$, $B_i = S_{L+i} \oplus M_{B,i}$:
-  $$V_i = (C_i \land A_i) \lor (C_i \land B_i) \lor (A_i \land B_i)$$
-  followed by hot-spare integrity verification checking Hamming distance $d_H(T_{\text{obs}}, \text{MAC}_{\text{spare}}) \le 2$ bits.
-- **Bijective 3D Spiral Space Transform on $(\mathbb{Z}_D)^3$:**
-  - *Layer 1 (Coprime Affine, $\gcd(a_k, D) = 1$):* $(x_1, y_1, z_1) = (a_x x + b_x,\; a_y y + b_y,\; a_z z + b_z) \bmod D$
-  - *Layer 2 (Triangular Feistel):*
-    $$x_2 \equiv x_1 + F_1(y_1, z_1) \pmod D,\quad y_2 \equiv y_1 + F_2(x_2, z_1) \pmod D,\quad z_2 \equiv z_1 + F_3(x_2, y_2) \pmod D$$
-- **Constant-Work Tri-Hash Core:** `fixed_budget_mix` executes *all three* primitives (`BLAKE2b`, `SHA3-256`, `HMAC-SHA256`) for `fixed_step_budget` iterations, forms $\text{HybridTriMix}_i = b_i \oplus (s_i \lll 3) \oplus (h_i \ggg 5)$, and selects the configured target branchlessly via `subtle::ConditionallySelectable`.
+**3-Cube Capability Synthesis:**
+
+```math
+K_{\text{root}} = \text{FixedBudgetMix}\Big(\text{Algo},\; \text{HMAC}\big(K_{\text{mother}},\; \text{"3cube-root"} \parallel S_{\text{owner}} \parallel \text{cid}\big),\; P_{\text{main}} \parallel S_{\text{synth}} \parallel K_{\text{auditor}}\Big)
+```
+
+**Ratcheted Ephemeral Key Derivation:**
+
+```math
+K_{\text{ratchet}} = \text{HMAC}\Big(K_{\text{root}},\; \text{"dh-ratchet-root-v1"} \parallel K_{\text{chain}} \parallel \text{X25519}(sk, pk_{\text{peer}})\Big)
+```
+
+**Bitwise Majority Voting (TMR):** For primary byte $C_i$ and unmasked shadow copies $A_i = S_i \oplus M_{A,i}$ and $B_i = S_{L+i} \oplus M_{B,i}$:
+
+```math
+V_i = (C_i \land A_i) \lor (C_i \land B_i) \lor (A_i \land B_i)
+```
+
+Followed by hot-spare integrity verification checking Hamming distance $d_H(T_{\text{obs}}, \text{MAC}_{\text{spare}}) \le 2$ bits.
+
+**Bijective 3D Spiral Space Transform on $(\mathbb{Z}_D)^3$:**
+- *Layer 1 (Coprime Affine, $\gcd(a_k, D) = 1$):* $(x_1, y_1, z_1) = (a_x x + b_x,\; a_y y + b_y,\; a_z z + b_z) \bmod D$
+- *Layer 2 (Triangular Feistel):*
+
+```math
+x_2 \equiv x_1 + F_1(y_1, z_1) \pmod D, \qquad y_2 \equiv y_1 + F_2(x_2, z_1) \pmod D, \qquad z_2 \equiv z_1 + F_3(x_2, y_2) \pmod D
+```
+
+**Constant-Work Tri-Hash Core:** `fixed_budget_mix` executes *all three* primitives (`BLAKE2b`, `SHA3-256`, `HMAC-SHA256`) for `fixed_step_budget` iterations, computes $\text{HybridTriMix}_i = b_i \oplus (s_i \lll 3) \oplus (h_i \ggg 5)$, and selects the configured target branchlessly via `subtle::ConditionallySelectable`.
 
 ---
 
