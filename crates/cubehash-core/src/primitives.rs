@@ -33,7 +33,7 @@ pub enum CombiningFn {
 
 /// Fills `buf` from the operating system CSPRNG.
 pub fn fill_random(buf: &mut [u8]) -> Result<()> {
-    getrandom::getrandom(buf).map_err(|_| CubeHashError::RngFailure)
+    getrandom::fill(buf).map_err(|_| CubeHashError::RngFailure)
 }
 
 /// Returns a random value uniformly distributed in `min..=max` using rejection sampling.
@@ -60,7 +60,8 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 
 /// Computes `HMAC-SHA256` over multiple ordered slices without allocating a combined buffer.
 pub fn hmac_sha256_parts(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
     for part in parts {
         mac.update(part);
     }
@@ -216,7 +217,7 @@ pub fn aead_seal(
     let cipher = XChaCha20Poly1305::new(key.into());
     cipher
         .encrypt(
-            XNonce::from_slice(nonce),
+            &XNonce::from(*nonce),
             Payload {
                 msg: plaintext,
                 aad,
@@ -235,7 +236,7 @@ pub fn aead_open(
     let cipher = XChaCha20Poly1305::new(key.into());
     cipher
         .decrypt(
-            XNonce::from_slice(nonce),
+            &XNonce::from(*nonce),
             Payload {
                 msg: ciphertext,
                 aad,
