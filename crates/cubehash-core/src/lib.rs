@@ -6,6 +6,7 @@ pub mod config;
 pub mod custody;
 pub mod error;
 pub mod honey;
+pub mod hybrid;
 pub mod mesh;
 pub mod primitives;
 pub mod spiral;
@@ -21,6 +22,7 @@ pub use custody::{
 };
 pub use error::{CubeHashError, Result};
 pub use honey::{DteEngine, HoneyProfile};
+pub use hybrid::{HybridTriMix, HybridTriMixHasher};
 pub use mesh::{
     build_custody_bundle, CellularMesh, DeliveryAck, DuplexCubeSession, EphemeralCubeAlgorithm,
     MeshAuditStats, PayloadMode, ReceiveOutcome, UniqueWireCube, WirePacket,

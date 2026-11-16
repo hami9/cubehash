@@ -4,7 +4,7 @@ All checks below were executed cleanly on this repository's pure algorithm works
 
 ---
 
-## 1. Automated Security Test Suite (`cubehash-core/tests/security_suite.rs` — 17/17 Passing)
+## 1. Automated Security Test Suite (`cubehash-core/tests/security_suite.rs` — 19/19 Passing)
 
 | # | Test Name | Security & Mathematical Property Verified |
 | --- | --- | --- |
@@ -25,6 +25,8 @@ All checks below were executed cleanly on this repository's pure algorithm works
 | 15 | `test_avalanche_sac_chi_square_and_baseline_indistinguishability` | Verifies 200-trial Strict Avalanche Criterion (`0.45..=0.55`) and `64 KiB` ciphertext uniformity (`ones_ratio`, `Shannon entropy > 7.99 b/B`, `Pearson chi2 < 330.5`, `|lag-1 autocorrelation| < 0.02`) side-by-side against standalone `XChaCha20-Poly1305` and `SHA-256`. |
 | 16 | `test_hybrid_trimix_combiner_strength_and_non_degeneracy` | Verifies algebraic combiner identity, non-degeneracy vs standalone `BLAKE2b`/`SHA3-256`/`HMAC-SHA256`, and ~50% domain/key single-bit avalanche. |
 | 17 | `test_system_level_decrypt_zero_oracle_timing_consistency` | Benchmarks authentic vs tampered-MAC, wrong-hardware, bad-sequence, and bad-dimension `decrypt_zero_oracle` probes across warmed caches, proving absence of order-of-magnitude early-exit timing divergence. |
+| 18 | `test_complete_hybrid_trimix_engine_256_512_xof_streaming_and_mac` | Verifies `HybridTriMix v2` independent subkey derivation, prefix-collision immunity, bit-exact incremental streaming (`HybridTriMixHasher`), constant-time `verify_tag_256`, unkeyed 512-bit non-degeneracy, and `64 KiB` `expand_xof` uniformity ($\chi^2 < 330.5$, Shannon entropy $> 7.99$ b/B). |
+| 19 | `test_two_tier_high_throughput_ratchet_and_forward_secrecy` | Verifies two-tier DH/symmetric ratcheting (`dh_rekey_interval = 16`) across `40` messages and 3 DH epochs, validating Curve25519 rotation at boundaries, symmetric forward secrecy on intermediate frames, TMR healing, zero-oracle tamper rejection, and rollback invariance. |
 
 ---
 
@@ -34,9 +36,9 @@ All checks below were executed cleanly on this repository's pure algorithm works
 
 ---
 
-## 3. Reproducible 10-Stage Audit & Benchmark Run (`cubehash-cli --release`)
+## 3. Reproducible 10-Stage Audit & Benchmark Run (`cubehash-cli --release`, `v1.0.2`)
 
-Observed live output from `cargo run --release -p cubehash-cli`:
+Observed live output from `cargo run --release --locked -p cubehash-cli`:
 
 ```text
 === CubeHash Security Engine Audit & Verification ===
@@ -46,44 +48,49 @@ Observed live output from `cargo run --release -p cubehash-cli`:
   - standard       mesh=100 quorum=25/20 core=32B sub=125B (1000 bits) base_wire=173B weight=16..=96B space=1000^3
   - high_capacity  mesh=160 quorum=40/32 core=64B sub=256B (2048 bits) base_wire=336B weight=32..=160B space=2000^3
 
-[2] 100-Cube Mesh Baseline: cubes=100 ram=18100 bytes (~17.7 KB) ones_ratio=0.5020 entropy=6.877 b/B
-    110-msg rotation OK -> oldest_gen=11 wire_ones_ratio=0.5009 wire_entropy=7.9919 b/B
+[2] 100-Cube Mesh Baseline: cubes=100 ram=18100 bytes (~17.7 KB) ones_ratio=0.5006 entropy=6.886 b/B
+    110-msg rotation OK -> oldest_gen=11 wire_ones_ratio=0.4993 wire_entropy=7.9927 b/B
 
 [3] Bitwise Majority Voting (TMR): injected 64 bit flips -> repaired 64 bits, MAC verified OK
 
 [4] Hardware Lock & 3-Cube Recovery: cloning blocked (hardware lock rejected execution on unauthorized device), recovery onto new device OK
 
-[5] Zero-Oracle Honey DTE: attacker probe emitted checksum-valid decoy "bless behave banana base alien abuse brush border autumn area beach black" without desync
+[5] Zero-Oracle Honey DTE: attacker probe emitted checksum-valid decoy "army bone boy beyond bracket affair blouse bridge because account arrest assume" without desync
 
 [6] Rollback & Bijective Epoch Hopping: rollback clean, epoch=1, spiral lookup found slot 55 in 8 steps
 
-[7] Fixed Step Budget & Throughput Benchmark:
-  - Blake2b        avg=8.75 us/op
-  - Sha3_256       avg=8.90 us/op
-  - HmacSha256     avg=8.89 us/op
-  - HybridTriMix   avg=8.67 us/op
-  - Full 100-cube E2E roundtrip (512B send + TMR + receive + ACK): 0.581 ms/msg
+[7] Fixed Step Budget, HybridTriMix v2 & Throughput Benchmark:
+  - HybridTriMix v2 (512-bit + Streaming + 64KiB XOF) -> OK | chi2(df=255)=259.45 | entropy=7.99714 b/B
+  - Blake2b        avg=6.49 us/op
+  - Sha3_256       avg=6.54 us/op
+  - HmacSha256     avg=5.97 us/op
+  - HybridTriMix   avg=5.98 us/op
+  - Full 100-cube E2E roundtrip (512B send + TMR + receive + ACK): 0.313 ms/msg
 
 [8] Cryptographic Strength Proof vs Standard Baselines (64 KiB + SAC):
-  - SAC 1-bit Avalanche  -> HybridTriMix: 50.36% | SHA3-256 baseline: 49.91%
-  - CubeHash-64KiB       ones=0.4994 entropy=7.99724 b/B chi2(df=255)=250.67 lag1=-0.00139
+  - SAC 1-bit Avalanche  -> HybridTriMix: 49.61% | SHA3-256 baseline: 49.91%
+  - CubeHash-64KiB       ones=0.5009 entropy=7.99709 b/B chi2(df=255)=264.43 lag1=-0.00251
   - XChaCha20-Poly1305   ones=0.5003 entropy=7.99719 b/B chi2(df=255)=255.19 lag1=+0.00011
   - SHA-256-CTR          ones=0.4995 entropy=7.99678 b/B chi2(df=255)=293.05 lag1=-0.00067
 
 [9] System-Level `decrypt_zero_oracle` Timing & Cache-Warmup Profile (N=200):
-  - Authentic        median=326.7 us  p95=465.7 us  mean=346.9 us
-  - TamperedMAC      median=323.6 us  p95=489.2 us  ratio=0.991x  welch_|t|=0.71
-  - WrongHardware    median=323.0 us  p95=478.0 us  ratio=0.989x  welch_|t|=0.55
-  - BadSequence      median=323.8 us  p95=492.0 us  ratio=0.991x  welch_|t|=0.05
-  - BadDimension     median=322.8 us  p95=487.1 us  ratio=0.988x  welch_|t|=1.00
+  - Authentic        median=185.8 us  p95=271.7 us  mean=200.0 us
+  - TamperedMAC      median=182.6 us  p95=270.1 us  ratio=0.983x  welch_|t|=0.81
+  - WrongHardware    median=182.3 us  p95=269.3 us  ratio=0.981x  welch_|t|=1.38
+  - BadSequence      median=182.6 us  p95=306.8 us  ratio=0.983x  welch_|t|=0.24
+  - BadDimension     median=182.7 us  p95=262.3 us  ratio=0.983x  welch_|t|=0.71
 
 [10] Release Throughput Proof: Standard Primitives vs CubeHash:
-  - Standard SHA3-256 (512B)          avg=2.34 us/op
-  - Standard BLAKE2b-512 (512B)       avg=1.04 us/op
-  - Standard HMAC-SHA256 (512B)       avg=0.88 us/op
-  - Standard X25519 scalar mult       avg=69.84 us/op
-  - Standard XChaCha20-Poly1305 (64K) avg=110.84 us/op (563.9 MB/s)
-  - CubeHash E2E Full 100-cube (64K)  avg=1.041 ms/msg (60.1 MB/s)
+  - Standard SHA3-256 (512B)          avg=2.38 us/op
+  - Standard BLAKE2b-512 (512B)       avg=0.88 us/op
+  - Standard HMAC-SHA256 (512B)       avg=0.95 us/op
+  - Standard X25519 scalar mult       avg=72.35 us/op
+  - Standard XChaCha20-Poly1305 (64K) avg=116.72 us/op (535.5 MB/s)
+  - CubeHash Encrypt (64K, dh=1)      avg=265.46 us/op (235.4 MB/s)
+  - CubeHash E2E 100-cube (64K, dh=1) avg=0.535 ms/msg (116.8 MB/s)
+  - CubeHash Encrypt (1M, dh=1)       avg=1.804 ms/op (554.2 MB/s)
+  - CubeHash Encrypt (64K, dh=64)     avg=113.57 us/op (550.3 MB/s)
+  - CubeHash E2E (64K, dh=64)         avg=230.83 us/msg (270.8 MB/s)
 
 ALL SECURITY AUDITS PASSED SUCCESSFULLY.
 ```
@@ -95,6 +102,6 @@ ALL SECURITY AUDITS PASSED SUCCESSFULLY.
 ```sh
 cargo fmt --all -- --check                              # formatting clean
 cargo clippy --workspace --all-targets -- -D warnings   # 0 warnings, exit 0
-cargo test --workspace                                  # 17 core + 1 FFI passed, 0 failed, 0 ignored
-cargo run --release -p cubehash-cli                     # 10/10 audit & proof stages passed
+cargo test --workspace --locked                         # 19 core + 1 FFI passed, 0 failed, 0 ignored
+cargo run --release --locked -p cubehash-cli            # 10/10 audit & proof stages passed
 ```

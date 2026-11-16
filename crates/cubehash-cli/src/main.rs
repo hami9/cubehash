@@ -6,8 +6,9 @@ use cubehash_core::primitives::{
     pearson_chi_square_uniform, shannon_entropy_bits_per_byte,
 };
 use cubehash_core::{
-    CellularMesh, CombiningFn, CubeHashError, DteEngine, HoneyProfile, MeshConfig, PayloadMode,
-    ReceiveOutcome, ThreeCubeCustody, TimeAlgorithm, VirtualHardwareEnclave, WirePacket,
+    CellularMesh, CombiningFn, CubeHashError, DteEngine, HoneyProfile, HybridTriMix, MeshConfig,
+    PayloadMode, ReceiveOutcome, ThreeCubeCustody, TimeAlgorithm, VirtualHardwareEnclave,
+    WirePacket,
 };
 use sha2::Sha256;
 use sha3::Sha3_256;
@@ -222,8 +223,29 @@ fn audit_ack_rollback_and_epochs() {
 }
 
 fn audit_fixed_budget_and_throughput() {
-    println!("\n[7] Fixed Step Budget & Throughput Benchmark:");
+    println!("\n[7] Fixed Step Budget, HybridTriMix v2 & Throughput Benchmark:");
     let key = [0x99u8; 32];
+    let mut stream_hasher = HybridTriMix::new_hasher(&key, b"cli-htx2");
+    stream_hasher.update(b"part-one-");
+    stream_hasher.update(b"part-two");
+    let htx_stream = stream_hasher.finalize_512(2);
+    let htx_oneshot = HybridTriMix::digest_512(&key, b"cli-htx2", b"part-one-part-two", 2);
+    assert_eq!(htx_stream, htx_oneshot);
+    let mac256 = HybridTriMix::mix_256(&key, b"cli-htx2", b"part-one-part-two", 2);
+    assert!(HybridTriMix::verify_tag_256(
+        &key,
+        b"cli-htx2",
+        b"part-one-part-two",
+        2,
+        &mac256
+    ));
+    let mut xof = vec![0u8; 65_536];
+    HybridTriMix::expand_xof(&key, b"cli-htx2", b"xof-audit", &mut xof);
+    println!(
+        "  - HybridTriMix v2 (512-bit + Streaming + 64KiB XOF) -> OK | chi2(df=255)={:.2} | entropy={:.5} b/B",
+        pearson_chi_square_uniform(&xof),
+        shannon_entropy_bits_per_byte(&xof)
+    );
     let data = [0x44u8; 128];
     for algo in [
         TimeAlgorithm::Blake2b,
@@ -566,18 +588,79 @@ fn audit_comparative_baseline_benchmarks() {
     .unwrap();
     let alice_hw = VirtualHardwareEnclave::random().unwrap();
     let bob_hw = VirtualHardwareEnclave::random().unwrap();
-    let (mut alice, mut bob) = CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
+    let (mut alice, mut bob) =
+        CellularMesh::new_paired(cfg.clone(), custody.clone(), &alice_hw, &bob_hw).unwrap();
 
-    let t5 = Instant::now();
+    // Standard per-message X25519 (dh=1): measure both encrypt-only and full E2E roundtrip on 64K
+    let mut enc_std_64k = std::time::Duration::ZERO;
+    let mut e2e_std_64k = std::time::Duration::ZERO;
     for _ in 0..100 {
+        let te = Instant::now();
         let mut pkt = alice.begin_send_message(&alice_hw, &buf_64k).unwrap();
+        let d_enc = te.elapsed();
+        enc_std_64k += d_enc;
+        let td = Instant::now();
+        let (_, ack, _) = bob.receive_authenticated(&bob_hw, &mut pkt).unwrap();
+        alice.commit_ack(&alice_hw, &ack).unwrap();
+        e2e_std_64k += d_enc + td.elapsed();
+    }
+    println!(
+        "  - CubeHash Encrypt (64K, dh=1)      avg={:.2} us/op ({:.1} MB/s)",
+        enc_std_64k.as_secs_f64() * 1e6 / 100.0,
+        (buf_64k.len() as f64 * 100.0 / (1024.0 * 1024.0)) / enc_std_64k.as_secs_f64()
+    );
+    println!(
+        "  - CubeHash E2E 100-cube (64K, dh=1) avg={:.3} ms/msg ({:.1} MB/s)",
+        e2e_std_64k.as_secs_f64() * 1000.0 / 100.0,
+        (buf_64k.len() as f64 * 100.0 / (1024.0 * 1024.0)) / e2e_std_64k.as_secs_f64()
+    );
+
+    // Bulk 1 MiB payload even with strict per-message X25519 (dh=1)
+    let buf_1m = vec![0xEFu8; 1024 * 1024];
+    let mut enc_std_1m = std::time::Duration::ZERO;
+    for _ in 0..24 {
+        let te = Instant::now();
+        let mut pkt = alice.begin_send_message(&alice_hw, &buf_1m).unwrap();
+        enc_std_1m += te.elapsed();
         let (_, ack, _) = bob.receive_authenticated(&bob_hw, &mut pkt).unwrap();
         alice.commit_ack(&alice_hw, &ack).unwrap();
     }
-    let cube_64k_dt = t5.elapsed().as_secs_f64();
     println!(
-        "  - CubeHash E2E Full 100-cube (64K)  avg={:.3} ms/msg ({:.1} MB/s)",
-        cube_64k_dt * 1000.0 / 100.0,
-        (buf_64k.len() as f64 * 100.0 / (1024.0 * 1024.0)) / cube_64k_dt
+        "  - CubeHash Encrypt (1M, dh=1)       avg={:.3} ms/op ({:.1} MB/s)",
+        enc_std_1m.as_secs_f64() * 1000.0 / 24.0,
+        (buf_1m.len() as f64 * 24.0 / (1024.0 * 1024.0)) / enc_std_1m.as_secs_f64()
+    );
+
+    // High-throughput two-tier ratchet (dh=64: X25519+quorum every 64 frames, HybridTriMix chain every frame)
+    let (mut alice_ht, mut bob_ht) =
+        CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
+    alice_ht.set_dh_rekey_interval(64);
+    bob_ht.set_dh_rekey_interval(64);
+    // Warm up past frame 1 handshake
+    let mut warm = alice_ht.begin_send_message(&alice_hw, &buf_64k).unwrap();
+    let (_, warm_ack, _) = bob_ht.receive_authenticated(&bob_hw, &mut warm).unwrap();
+    alice_ht.commit_ack(&alice_hw, &warm_ack).unwrap();
+
+    let mut enc_ht_64k = std::time::Duration::ZERO;
+    let mut e2e_ht_64k = std::time::Duration::ZERO;
+    for _ in 0..200 {
+        let te = Instant::now();
+        let mut pkt = alice_ht.begin_send_message(&alice_hw, &buf_64k).unwrap();
+        let d_enc = te.elapsed();
+        enc_ht_64k += d_enc;
+        let td = Instant::now();
+        let (_, ack, _) = bob_ht.receive_authenticated(&bob_hw, &mut pkt).unwrap();
+        alice_ht.commit_ack(&alice_hw, &ack).unwrap();
+        e2e_ht_64k += d_enc + td.elapsed();
+    }
+    println!(
+        "  - CubeHash Encrypt (64K, dh=64)     avg={:.2} us/op ({:.1} MB/s)",
+        enc_ht_64k.as_secs_f64() * 1e6 / 200.0,
+        (buf_64k.len() as f64 * 200.0 / (1024.0 * 1024.0)) / enc_ht_64k.as_secs_f64()
+    );
+    println!(
+        "  - CubeHash E2E (64K, dh=64)         avg={:.2} us/msg ({:.1} MB/s)",
+        e2e_ht_64k.as_secs_f64() * 1e6 / 200.0,
+        (buf_64k.len() as f64 * 200.0 / (1024.0 * 1024.0)) / e2e_ht_64k.as_secs_f64()
     );
 }

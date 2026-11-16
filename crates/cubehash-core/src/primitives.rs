@@ -111,34 +111,61 @@ pub fn fixed_budget_mix(
     rounds: usize,
 ) -> [u8; 32] {
     let iterations = rounds.max(1);
-    let mut state_blake = [0u8; 32];
-    let mut state_sha3 = [0u8; 32];
-    let mut state_hmac = [0u8; 32];
+    let key_len = (key.len() as u64).to_le_bytes();
+    let dom_len = (domain.len() as u64).to_le_bytes();
+    let data_len = (data.len() as u64).to_le_bytes();
 
-    for round in 0..iterations {
+    // Round 0 absorbs arbitrary-length inputs once per primitive with canonical length framing.
+    let mut b2 = Blake2b512::new();
+    b2.update(b"FB-B2");
+    b2.update(key_len);
+    b2.update(key);
+    b2.update(dom_len);
+    b2.update(domain);
+    b2.update(data_len);
+    b2.update(data);
+    let b2_init = b2.finalize();
+    let mut state_blake = [0u8; 32];
+    for i in 0..32 {
+        state_blake[i] = b2_init[i] ^ b2_init[32 + i];
+    }
+
+    let mut s3 = Sha3_256::new();
+    s3.update(b"FB-S3");
+    s3.update(key_len);
+    s3.update(key);
+    s3.update(dom_len);
+    s3.update(domain);
+    s3.update(data_len);
+    s3.update(data);
+    let mut state_sha3: [u8; 32] = s3.finalize().into();
+
+    let mut state_hmac = hmac_sha256_parts(key, &[b"FB-HM", &dom_len, domain, &data_len, data]);
+
+    // Subsequent rounds ratchet compact 32-byte states cleanly under constant iteration work.
+    for round in 1..iterations {
         let r_bytes = (round as u64).to_le_bytes();
 
-        // 1. BLAKE2b leg
-        let mut b2 = Blake2b512::new();
-        b2.update(key);
-        b2.update(domain);
-        b2.update(r_bytes);
-        b2.update(state_blake);
-        b2.update(data);
-        let b2_full = b2.finalize();
-        state_blake.copy_from_slice(&b2_full[..32]);
+        let mut b2r = Blake2b512::new();
+        b2r.update(b"FB-R-B2");
+        b2r.update(key_len);
+        b2r.update(key);
+        b2r.update(r_bytes);
+        b2r.update(state_blake);
+        let b2_full = b2r.finalize();
+        for i in 0..32 {
+            state_blake[i] = b2_full[i] ^ b2_full[32 + i];
+        }
 
-        // 2. SHA3-256 leg
-        let mut s3 = Sha3_256::new();
-        s3.update(key);
-        s3.update(domain);
-        s3.update(r_bytes);
-        s3.update(state_sha3);
-        s3.update(data);
-        state_sha3.copy_from_slice(&s3.finalize());
+        let mut s3r = Sha3_256::new();
+        s3r.update(b"FB-R-S3");
+        s3r.update(key_len);
+        s3r.update(key);
+        s3r.update(r_bytes);
+        s3r.update(state_sha3);
+        state_sha3.copy_from_slice(&s3r.finalize());
 
-        // 3. HMAC-SHA256 leg
-        state_hmac = hmac_sha256_parts(key, &[domain, &r_bytes, &state_hmac, data]);
+        state_hmac = hmac_sha256_parts(key, &[b"FB-R-HM", &r_bytes, &state_hmac]);
     }
 
     let mut hybrid = [0u8; 32];
@@ -169,13 +196,15 @@ pub fn combine_non_linear(
 ) -> [u8; 32] {
     let mut acc = [0u8; 32];
     for (idx, chunk) in inputs.iter().enumerate() {
-        let step_digest = fixed_budget_mix(
-            TimeAlgorithm::HybridTriMix,
-            algo_key,
-            &(idx as u64).to_le_bytes(),
-            chunk,
-            budget,
-        );
+        let mut b2 = Blake2b512::new();
+        b2.update(b"combine-step-v2");
+        b2.update(algo_key);
+        b2.update((idx as u64).to_le_bytes());
+        b2.update((chunk.len() as u64).to_le_bytes());
+        b2.update(chunk);
+        let full = b2.finalize();
+        let mut step_digest = [0u8; 32];
+        step_digest.copy_from_slice(&full[..32]);
         match combiner {
             CombiningFn::XorFoldMix => {
                 for i in 0..32 {
@@ -197,7 +226,7 @@ pub fn combine_non_linear(
             }
         }
     }
-    // Final fixed-budget whitening pass across the accumulator.
+    // Final fixed-budget HybridTriMix whitening pass across the accumulator.
     fixed_budget_mix(
         TimeAlgorithm::HybridTriMix,
         algo_key,
