@@ -14,7 +14,7 @@ authors = ["CubeHash Authors"]
 description = "General-purpose hierarchical, self-healing, hardware-bound cellular cube cryptography engine"
 
 [workspace.dependencies]
-blake2 = "0.10"
+blake2 = "0.11"
 chacha20poly1305 = "0.10"
 getrandom = "0.2"
 hkdf = "0.12"
