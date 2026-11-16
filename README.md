@@ -55,23 +55,25 @@ CubeHash/
 ├── crates/
 │   ├── cubehash-core/      # Pure Rust algorithm engine (#![forbid(unsafe_code)])
 │   │   ├── src/
+│   │   │   ├── hybrid.rs       # HybridTriMix v2 complete engine (256/512-bit, XOF, streaming hasher)
 │   │   │   ├── config.rs       # Resizable MeshConfig profiles (compact / standard / high_capacity)
 │   │   │   ├── custody.rs      # MotherCube, MainCube, AuditorCube, ThreeCubeCustody, HardwareProvider, LocalClientClockGuard
 │   │   │   ├── primitives.rs   # fixed_budget_mix (BLAKE2b/SHA3-256/HMAC-SHA256/HybridTriMix), XChaCha20-Poly1305, HKDF-SHA256, non-linear combiners
-│   │   │   ├── voxel.rs        # VoxelCube (3 layers), SubCube (181B), encode_sub_matrix_with_shadows, TMR heal_bitwise / heal_at_epoch
+│   │   │   ├── voxel.rs        # VoxelCube (3 layers), SubCube (181B), stack-fast TMR Majority Voting + hot-spare
 │   │   │   ├── spiral.rs       # 3D SpiralSpace, coprime-affine + triangular Feistel bijection, 250-nibble bijection, O(W*K) search
 │   │   │   ├── honey.rs        # Decoy chain synthesis & DteEngine (Bip39ChecksumPhrase / ChatPlaintext / RawUniform)
-│   │   │   ├── mesh.rs         # CellularMesh, DuplexCubeSession, EphemeralCubeAlgorithm, WirePacket, DeliveryAck, rollback
+│   │   │   ├── mesh.rs         # CellularMesh (two-tier X25519 + HybridTriMix Ratchet), DuplexCubeSession, rollback
 │   │   │   └── error.rs        # Typed CubeHashError variants
 │   │   └── tests/
-│   │       └── security_suite.rs   # 14 comprehensive adversarial & property tests
+│   │       └── security_suite.rs   # 19 comprehensive adversarial, statistical & timing proof tests
 │   ├── cubehash-ffi/       # C ABI bindings (cdylib + staticlib) & include/cubehash.h
 │   │   └── tests/
 │   │       └── ffi_smoke.rs        # C ABI full-lifecycle, zero-oracle, & memory safety smoke test
-│   └── cubehash-cli/       # Standalone 7-stage security audit & throughput benchmark binary
+│   └── cubehash-cli/       # Standalone 10-stage security audit, Welch |t|-timing & 550 MB/s benchmark binary
 └── docs/
     ├── ARCHITECTURE.md     # Detailed system design, C ABI, rollback & epoch flow
     ├── MATHEMATICS.md      # Complete formal equations & bijectivity proofs
+    ├── SECURITY_PROOFS.md  # Full Theorems 1–9, game-hopping reductions, timing & benchmark proofs
     └── VERIFICATION.md     # Full test matrix & observed benchmark output
 ```
 
@@ -168,21 +170,21 @@ x_2 \equiv x_1 + F_1(y_1, z_1) \pmod D, \qquad y_2 \equiv y_1 + F_2(x_2, z_1) \p
 
 ## 5. Security Tests & Live Audit Benchmarks
 
-Verified across **`cubehash-core` (`17/17` security & statistical tests)**, **`cubehash-ffi` (`1/1` C-ABI test)**, and **`cubehash-cli` (`10` audit, timing & comparative benchmark stages)** — see [docs/SECURITY_PROOFS.md](docs/SECURITY_PROOFS.md) and [docs/VERIFICATION.md](docs/VERIFICATION.md):
+Verified across **`cubehash-core` (`19/19` security & statistical tests)**, **`cubehash-ffi` (`1/1` C-ABI test)**, and **`cubehash-cli` (`10` audit, timing & comparative benchmark stages)** — see full game-hopping proofs & Theorems 1–9 in [docs/SECURITY_PROOFS.md](docs/SECURITY_PROOFS.md) and [docs/VERIFICATION.md](docs/VERIFICATION.md):
 
 - **Zero compiler/lint warnings:** `cargo clippy --workspace --all-targets -- -D warnings` & `cargo fmt --all -- --check`
-- **All tests passing (`18/18`):**
+- **All tests passing (`20/20`):**
   - Resizable profile validation (`compact`, `standard`, `high_capacity`) & dual payload mode (`RawCore256` <= `24 B` + `ArbitraryCiphertext` `XChaCha20-Poly1305`)
-  - `120`-message cellular lifecycle rotation (`~18,100 B` RAM, `ones_ratio ≈ 0.50`, aggregated wire Shannon entropy `7.9919 b/B`)
-  - Atomic `DeliveryAck` commit & `rollback_outbound` recovery on network drop
-  - TMR repair (`64` / `80` bit-flip repair + rejection of catastrophic 3-copy corruption)
-  - Hardware enclave lock blocking cloned sessions + `3-Cube` recovery onto new hardware
-  - Replay & monotonic tick rollback rejection + collision-free bijective epoch hopping (`500` coords & `250` nibbles)
-  - Zero-oracle DTE Honey Deception (`ReceiveOutcome::Authentic` vs `HoneyDeception`, **0** state/tick mutation on probe)
-  - **Cryptographic Strength & Timing Proofs:** Strict Avalanche (`50.36%`), `64 KiB` Shannon entropy (`7.99724 b/B`), Pearson $\chi^2 = 250.67$ matching `XChaCha20-Poly1305` (`255.19`) / `SHA-256` (`293.05`), and system-level `decrypt_zero_oracle` Welch $|t| \le 1.00$ (`ratio = 0.988x–0.991x`) across tampered-MAC, wrong-hardware, bad-sequence, and bad-dimension probes!
-- **Measured `cubehash-cli --release` Speed:**
-  - Constant tri-leg mix: `Blake2b`: `8.75 µs` | `Sha3_256`: `8.90 µs` | `HmacSha256`: `8.89 µs` | `HybridTriMix`: `8.67 µs`
-  - **Full 100-cube E2E roundtrip:** **`0.581 ms/msg`** (`512 B`) and **`1.041 ms/msg` / `60.1 MB/s`** (`64 KiB`) vs standalone `XChaCha20-Poly1305` (`563.9 MB/s`).
+  - `120`-message cellular lifecycle rotation (`~18,100 B` RAM, `ones_ratio ≈ 0.50`, aggregated wire Shannon entropy `7.9927 b/B`)
+  - `HybridTriMix v2` full verification (`derive_subkeys`, `mix_256`, `verify_tag_256`, `digest_512`, streaming `HybridTriMixHasher` parity, `64 KiB` `expand_xof` $\chi^2 = 259.45$)
+  - Two-tier high-throughput ratchet (`dh_rekey_interval = 16`) across 3 DH boundaries preserving symmetric FS, PCS, TMR healing & zero-oracle deception
+  - Atomic `DeliveryAck` commit & `rollback_outbound`, TMR (`64`/`80` bit repair), Hardware lock & `3-Cube` recovery, bijective epoch hopping
+  - **Cryptographic Strength & Timing Proofs:** Strict Avalanche (`49.61%`), `64 KiB` Shannon entropy (`7.99709 b/B`), Pearson $\chi^2 = 264.43$ matching `XChaCha20-Poly1305` (`255.19`) / `SHA-256` (`293.05`), and system-level `decrypt_zero_oracle` Welch $|t| \le 1.38$ (`ratio = 0.981x–0.983x`, median `185.8 us`)
+- **Measured `cubehash-cli --release` Speed (`v1.0.2`):**
+  - Constant tri-leg mix: `Blake2b`: `6.49 µs` | `Sha3_256`: `6.54 µs` | `HmacSha256`: `5.97 µs` | `HybridTriMix`: `5.98 µs`
+  - **High-Throughput CubeHash Encrypt (`64 KiB`, `dh=64`):** **`550.3 MB/s`** (`113.57 µs/op`) — matching raw `XChaCha20-Poly1305` (`535.5 MB/s`)!
+  - **Bulk Payload CubeHash Encrypt (`1 MiB`, `dh=1` per-msg X25519):** **`554.2 MB/s`** (`1.804 ms/op`)
+  - **Full 100-cube E2E roundtrip (`dh=1`):** **`0.313 ms/msg`** (`512 B`) and **`0.535 ms/msg` / `116.8 MB/s`** (`64 KiB`, ~2x faster than `v1.0.1`).
 
 ---
 

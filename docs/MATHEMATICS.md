@@ -62,31 +62,45 @@ and `LocalClientClockGuard` is re-sealed under $\mathcal{H}'$, permanently revok
 
 ---
 
-## 3. Constant-Work Multi-Hash Core (`fixed_budget_mix`)
+## 3. Complete Hybrid Multi-Hash Engine (`HybridTriMix v2` & `fixed_budget_mix`)
 
-To eliminate timing variance between chosen digest algorithms (`TimeAlgorithm`), every call executes **all three independent legs** for $B \ge 1$ sequential rounds starting from zeroized accumulators $S_{\text{BLAKE}} = S_{\text{SHA3}} = S_{\text{HMAC}} = 0^{256}$:
+### 3.1 Canonical Framing, Independent Subkeys & Bijective Cross-Lane Mixing (`HybridTriMix`)
 
-For round $r \in \{0, \dots, B-1\}$:
+Implemented in `crates/cubehash-core/src/hybrid.rs`, `HybridTriMix` binds three unrelated cryptographic families (`BLAKE2b-512`, `SHA3-256/512`, `HMAC-SHA256/512`) under injective length framing:
 
 ```math
-S_{\text{BLAKE}} \leftarrow \text{BLAKE2b-512}\big(K \parallel \text{dom} \parallel \langle r \rangle_8 \parallel S_{\text{BLAKE}} \parallel X\big)[0..32]
+\text{PRK} = \text{HMAC}\big(K,\; \text{"HTX2-MASTER"} \parallel \langle |K| \rangle_8 \parallel K \parallel \langle |D| \rangle_8 \parallel D\big)
 ```
 
 ```math
-S_{\text{SHA3}} \leftarrow \text{SHA3-256}\big(K \parallel \text{dom} \parallel \langle r \rangle_8 \parallel S_{\text{SHA3}} \parallel X\big)
+K_B = \text{HMAC}(\text{PRK}, \text{"HTX2-SUBKEY-BLAKE2B"}), \quad K_S = \text{HMAC}(\text{PRK}, \text{"HTX2-SUBKEY-SHA3"}), \quad K_H = \text{HMAC}(\text{PRK}, \text{"HTX2-SUBKEY-HMAC"})
+```
+
+For input stream $M$, each leg absorbs $(\langle |D| \rangle_8 \parallel D \parallel M \parallel \langle |M| \rangle_8)$ in a single pass (matching incremental `HybridTriMixHasher` bit-for-bit), executes $R - 1$ fixed-size state ratchet rounds, combines bytewise rotations $Y_{\text{rot}, i} = S_{B,i} \oplus (S_{S,i} \lll 3) \oplus (S_{H,i} \ggg 5)$, and applies the invertible triangular 64-bit word permutation $\Pi_n$ ($n \in \{256, 512\}$). Arbitrarily long streams derive counter blocks $\text{HybridTriMix}_{512}(\text{seed}, \text{"HTX2-XOF-BLK"}, \langle c \rangle_8)$ (`expand_xof`).
+
+### 3.2 Constant-Work `TimeAlgorithm` Selector (`fixed_budget_mix`)
+
+To eliminate timing variance between chosen digest algorithms (`TimeAlgorithm`), `fixed_budget_mix` absorbs canonical length-framed $(\langle |K| \rangle_8 \parallel K \parallel \langle |D| \rangle_8 \parallel D \parallel \langle |X| \rangle_8 \parallel X)$ across **all three independent legs** in Round 0, ratchets the 32-byte accumulators for $B - 1$ additional constant rounds:
+
+```math
+S_{\text{BLAKE}} \leftarrow \text{BLAKE2b-512}\big(\text{"FB-R-B2"} \parallel \langle |K| \rangle_8 \parallel K \parallel \langle r \rangle_8 \parallel S_{\text{BLAKE}}\big)[0..32] \oplus [32..64]
 ```
 
 ```math
-S_{\text{HMAC}} \leftarrow \text{HMAC}\big(K,\; \text{dom} \parallel \langle r \rangle_8 \parallel S_{\text{HMAC}} \parallel X\big)
+S_{\text{SHA3}} \leftarrow \text{SHA3-256}\big(\text{"FB-R-S3"} \parallel \langle |K| \rangle_8 \parallel K \parallel \langle r \rangle_8 \parallel S_{\text{SHA3}}\big)
 ```
 
-Then the hybrid leg combines bit-rotations byte-wise:
+```math
+S_{\text{HMAC}} \leftarrow \text{HMAC}\big(K,\; \text{"FB-R-HM"} \parallel \langle r \rangle_8 \parallel S_{\text{HMAC}}\big)
+```
+
+Then combines the hybrid leg byte-wise:
 
 ```math
 H_i = S_{\text{BLAKE}, i} \oplus (S_{\text{SHA3}, i} \lll 3) \oplus (S_{\text{HMAC}, i} \ggg 5) \quad \forall i \in \{0, \dots, 31\}
 ```
 
-Finally, the configured target algorithm digest is selected **without secret-dependent branches** using `subtle::ConditionallySelectable` masks across $(S_{\text{BLAKE}}, S_{\text{SHA3}}, S_{\text{HMAC}}, H)$.
+and selects the target digest branchlessly via `subtle::ConditionallySelectable`.
 
 ---
 
@@ -142,8 +156,10 @@ C_{\text{256b}} = P_{\text{core}} \oplus W(K_{\text{algo}}, \text{"wire-core-mas
 ```
 
 ```math
-M_{\text{pkt}} = \text{HMAC}\big(K_{\text{algo}},\; \text{mode\_tag} \parallel f \parallel \langle s \rangle_8 \parallel \langle e \rangle_8 \parallel pk_{\text{eph}} \parallel C_{\text{256b}} \parallel C_{\text{wire}}\big)
+M_{\text{pkt}} = \text{HMAC}\big(K_{\text{algo}},\; \text{"wire-mac-aead-tag-v3"} \parallel f \parallel \langle s \rangle_8 \parallel \langle e \rangle_8 \parallel pk_{\text{eph}} \parallel C_{\text{256b}} \parallel \langle |C_{\text{wire}}| \rangle_8 \parallel T_{\text{Poly}}\big)
 ```
+
+where $T_{\text{Poly}}$ is the trailing 16-byte Poly1305 authentication tag over $(A, C_{\text{wire}})$. In two-tier high-throughput mode (`dh_rekey_interval` = $k > 1$), packets with $(s - 1) \bmod k \ne 0$ step $K_{\text{ratchet}}$ via `HMAC(K_root, "sym-ratchet-root-v2" || K_chain || pk_peer)` and synthesize $K_{\text{algo}}$ via `HybridTriMix::mix_256` before ratcheting $K_{\text{chain}}$ forward irreversibly.
 
 6. **ACK Authentication & Ratchet Chain Advancement:**
    After receiver decrypts cleanly and generates a brand-new X25519 keypair $(sk'_{\text{rx}}, pk'_{\text{rx}})$:
@@ -166,10 +182,10 @@ K_{\text{chain}} \leftarrow \text{HMAC}\big(K_{\text{chain}},\; \text{"dh-ratche
 
 ## 5. Non-Linear Cellular Evolution (`25` Select / `20` Consume / `1` Kill + `1` Birth)
 
-Using the first $C = 20$ cubes from $\mathcal{Q}$, `combine_non_linear` first maps each selected cube core $X_k$ through:
+Using the first $C = 20$ cubes from $\mathcal{Q}$, `combine_non_linear` maps each selected cube core $X_k$ through a domain-separated keyed compression step:
 
 ```math
-d_k = \text{FixedBudgetMix}(\text{HybridTriMix}, K_{\text{algo}}, \langle k \rangle_8, X_k, B), \qquad k \in \{0, \dots, C-1\}
+d_k = \text{BLAKE2b-512}\big(\text{"combine-step-v2"} \parallel K_{\text{algo}} \parallel \langle k \rangle_8 \parallel \langle |X_k| \rangle_8 \parallel X_k\big)[0..32], \qquad k \in \{0, \dots, C-1\}
 ```
 
 and folds them using one of three configured non-linear modes (`CombiningFn`) into a 32-byte accumulator $A$:

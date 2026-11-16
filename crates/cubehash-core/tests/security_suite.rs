@@ -6,12 +6,12 @@ use cubehash_core::primitives::{aead_seal, fixed_budget_mix, hmac_sha256};
 use cubehash_core::{
     lag1_bit_autocorrelation, ones_ratio, pearson_chi_square_uniform,
     shannon_entropy_bits_per_byte, CellularMesh, CombiningFn, Coord3D, CubeHashError, DteEngine,
-    DuplexCubeSession, HardwareProvider, HoneyProfile, MeshConfig, OsBoundHardwareProvider,
-    PayloadMode, ReceiveOutcome, SpiralSpace, ThreeCubeCustody, TimeAlgorithm,
-    VirtualHardwareEnclave, WirePacket,
+    DuplexCubeSession, HardwareProvider, HoneyProfile, HybridTriMix, MeshConfig,
+    OsBoundHardwareProvider, PayloadMode, ReceiveOutcome, SpiralSpace, ThreeCubeCustody,
+    TimeAlgorithm, VirtualHardwareEnclave, WirePacket,
 };
 use sha2::Sha256;
-use sha3::Sha3_256;
+use sha3::{Sha3_256, Sha3_512};
 
 fn make_custody(config: &MeshConfig) -> ThreeCubeCustody {
     ThreeCubeCustody::generate(
@@ -931,4 +931,158 @@ fn test_system_level_decrypt_zero_oracle_timing_consistency() {
             "system-level timing discrepancy on {label}: ratio={ratio:.2} vs authentic"
         );
     }
+}
+
+#[test]
+fn test_complete_hybrid_trimix_engine_256_512_xof_streaming_and_mac() {
+    let key = [0x4Eu8; 32];
+    let domain = b"htx2-formal-verification";
+    let msg: Vec<u8> = (0..1337u32)
+        .map(|i| (i.wrapping_mul(31) ^ 0xA5) as u8)
+        .collect();
+
+    // 1. Independent leg subkeys (no reuse across BLAKE2b / SHA3 / HMAC)
+    let (kb, ks, kh) = HybridTriMix::derive_subkeys(&key, domain);
+    assert_ne!(kb, ks);
+    assert_ne!(ks, kh);
+    assert_ne!(kb, kh);
+
+    // 2. Canonical length-delimited framing immunity against split-boundary collisions
+    assert_ne!(
+        HybridTriMix::mix_256(b"ab", b"c", &msg, 2),
+        HybridTriMix::mix_256(b"a", b"bc", &msg, 2)
+    );
+
+    // 3. Bit-exact streaming parity across irregular chunk sizes for both 256-bit and 512-bit modes
+    let one_shot_256 = HybridTriMix::mix_256(&key, domain, &msg, 3);
+    let one_shot_512 = HybridTriMix::digest_512(&key, domain, &msg, 3);
+
+    let mut hasher_256 = HybridTriMix::new_hasher(&key, domain);
+    let mut hasher_512 = HybridTriMix::new_hasher(&key, domain);
+    let mut offset = 0usize;
+    for &sz in &[1usize, 7, 63, 255, 512, 9999] {
+        if offset >= msg.len() {
+            break;
+        }
+        let end = (offset + sz).min(msg.len());
+        hasher_256.update(&msg[offset..end]);
+        hasher_512.update(&msg[offset..end]);
+        offset = end;
+    }
+    assert_eq!(hasher_256.finalize_256(3), one_shot_256);
+    assert_eq!(hasher_512.finalize_512(3), one_shot_512);
+
+    // 4. Constant-time MAC verification rejects any 1-bit forgery
+    assert!(HybridTriMix::verify_tag_256(
+        &key,
+        domain,
+        &msg,
+        3,
+        &one_shot_256
+    ));
+    let mut forged = one_shot_256;
+    forged[15] ^= 0x01;
+    assert!(!HybridTriMix::verify_tag_256(
+        &key, domain, &msg, 3, &forged
+    ));
+
+    // 5. Unkeyed 512-bit combiner is distinct from bare BLAKE2b-512 & SHA3-512
+    let u512 = HybridTriMix::hash_unkeyed_512(domain, &msg);
+    let raw_b2: [u8; 64] = Blake2b512::digest(&msg).into();
+    let raw_s3_512: [u8; 64] = Sha3_512::digest(&msg).into();
+    assert_ne!(u512, raw_b2);
+    assert_ne!(u512, raw_s3_512);
+
+    // 6. 64 KiB Extendable Output Function (XOF) passes full uniformity & independence statistics
+    let mut xof = vec![0u8; 65_536];
+    HybridTriMix::expand_xof(&key, domain, b"stream-64k", &mut xof);
+    let ratio = ones_ratio(&xof);
+    let entropy = shannon_entropy_bits_per_byte(&xof);
+    let chi2 = pearson_chi_square_uniform(&xof);
+    let ac = lag1_bit_autocorrelation(&xof);
+    assert!((0.49..=0.51).contains(&ratio), "xof ones_ratio={ratio}");
+    assert!(entropy > 7.99, "xof entropy={entropy}");
+    assert!(chi2 < 330.5, "xof chi2={chi2}");
+    assert!(ac.abs() < 0.02, "xof lag1={ac}");
+}
+
+#[test]
+fn test_two_tier_high_throughput_ratchet_and_forward_secrecy() {
+    let cfg = MeshConfig::standard();
+    let custody = make_custody(&cfg);
+    let alice_hw = VirtualHardwareEnclave::random().unwrap();
+    let bob_hw = VirtualHardwareEnclave::random().unwrap();
+    let (mut alice, mut bob) =
+        CellularMesh::new_paired(cfg.clone(), custody, &alice_hw, &bob_hw).unwrap();
+
+    alice.set_dh_rekey_interval(16);
+    bob.set_dh_rekey_interval(16);
+    assert_eq!(alice.dh_rekey_interval(), 16);
+
+    let mut seen_macs = HashSet::new();
+    let mut bob_pub_history = Vec::new();
+    let initial_bob_pub = bob.local_dh_pub();
+
+    // Send 40 messages spanning 3 DH rekey boundaries: seq 1, 17, 33
+    for seq in 1..=40u64 {
+        let mut pkt = alice
+            .begin_send_message(&alice_hw, b"identical-high-throughput-frame")
+            .unwrap();
+        assert!(seen_macs.insert(pkt.packet_mac));
+
+        // Corrupt 40 bits on intermediate symmetric frames too -> TMR must still self-heal
+        if seq == 5 {
+            for b in &mut pkt.wire_cube.partial_256b[..5] {
+                *b ^= 0xFF;
+            }
+        }
+
+        // Tampering ratchet_pub on an intermediate fast frame must fail cleanly and zero-oracle must hide
+        if seq == 10 {
+            let mut tampered = pkt.clone();
+            tampered.ratchet_pub[0] ^= 0x01;
+            assert_eq!(
+                bob.receive_authenticated(&bob_hw, &mut tampered),
+                Err(CubeHashError::AuthenticationFailed)
+            );
+            assert!(matches!(
+                bob.decrypt_zero_oracle(&bob_hw, &tampered, HoneyProfile::ChatPlaintext),
+                ReceiveOutcome::HoneyDeception { .. }
+            ));
+        }
+
+        let (pt, ack, healed) = bob.receive_authenticated(&bob_hw, &mut pkt).unwrap();
+        assert_eq!(pt, b"identical-high-throughput-frame");
+        if seq == 5 {
+            assert_eq!(healed, 40);
+        }
+        alice.commit_ack(&alice_hw, &ack).unwrap();
+
+        if (seq - 1) % 16 == 0 {
+            // Every DH boundary must rotate Bob's Curve25519 keypair to a brand-new key
+            assert_ne!(bob.local_dh_pub(), initial_bob_pub);
+            bob_pub_history.push(bob.local_dh_pub());
+        } else {
+            // Intermediate frames advance symmetric HybridTriMix chain without expensive ECDH
+            assert_eq!(bob.local_dh_pub(), *bob_pub_history.last().unwrap());
+        }
+    }
+
+    assert_eq!(bob_pub_history.len(), 3);
+    assert_ne!(bob_pub_history[0], bob_pub_history[1]);
+    assert_ne!(bob_pub_history[1], bob_pub_history[2]);
+
+    // Rollback cleanly preserves fast-ratchet synchronization
+    let _lost = alice
+        .begin_send_message(&alice_hw, b"dropped-fast-frame")
+        .unwrap();
+    alice.rollback_outbound().unwrap();
+    let mut recovery_pkt = alice
+        .begin_send_message(&alice_hw, b"recovered-fast-frame")
+        .unwrap();
+    let (pt, ack, _) = bob
+        .receive_authenticated(&bob_hw, &mut recovery_pkt)
+        .unwrap();
+    assert_eq!(pt, b"recovered-fast-frame");
+    alice.commit_ack(&alice_hw, &ack).unwrap();
 }

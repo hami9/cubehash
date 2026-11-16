@@ -8,12 +8,13 @@ use crate::custody::{
 };
 use crate::error::{CubeHashError, Result};
 use crate::honey::{generate_decoy_cubes, DteEngine, HoneyProfile};
+use crate::hybrid::HybridTriMix;
 use crate::primitives::{
     aead_open, aead_seal, combine_non_linear, constant_time_eq, fill_random, fixed_budget_mix,
     hkdf_expand_label, hmac_sha256_parts, whitened_stream,
 };
 use crate::spiral::{Coord3D, SpiralSpace};
-use crate::voxel::{encode_sub_matrix_with_shadows, generate_variable_weight, VoxelCube};
+use crate::voxel::{encode_sub_matrix_with_shadows, generate_variable_weight_seeded, VoxelCube};
 
 const CORE_FLAG_RAW: u8 = 0x01;
 const CORE_FLAG_AEAD: u8 = 0x02;
@@ -116,15 +117,16 @@ struct PendingTransition {
     cube_fingerprint: [u8; FINGERPRINT_BYTES],
     next_sequence: u64,
     kill_idx: usize,
-    born_cube: VoxelCube,
+    born_cube: Option<VoxelCube>,
     #[zeroize(skip)]
     born_coord: Coord3D,
     next_main_root: [u8; 32],
     ack_mac_key: [u8; 32],
     dh_out: [u8; 32],
+    dh_step: bool,
 }
 
-/// Synchronized 100-cube cellular cryptography mesh (`Section 5`) with per-message X25519 DH Ratchet.
+/// Synchronized 100-cube cellular cryptography mesh (`Section 5`) with two-tier X25519 + HybridTriMix Ratchet.
 pub struct CellularMesh {
     config: MeshConfig,
     cubes: Vec<VoxelCube>,
@@ -133,9 +135,19 @@ pub struct CellularMesh {
     custody: ThreeCubeCustody,
     clock_guard: LocalClientClockGuard,
     ratchet: DhRatchetState,
+    cached_root_cap: [u8; 32],
+    cached_epoch_key: [u8; 32],
+    dh_rekey_interval: u64,
     epoch: u64,
     sequence: u64,
     pending_outbound: Option<PendingTransition>,
+}
+
+impl Drop for CellularMesh {
+    fn drop(&mut self) {
+        self.cached_root_cap.zeroize();
+        self.cached_epoch_key.zeroize();
+    }
 }
 
 impl CellularMesh {
@@ -160,13 +172,13 @@ impl CellularMesh {
             ));
         }
 
-        let mut root_cap = custody.derive_root_capability(config.fixed_step_budget);
+        let cached_root_cap = custody.derive_root_capability(config.fixed_step_budget);
         let mut raw_hw_secret = [0u8; 32];
         fill_random(&mut raw_hw_secret)?;
         let clock_guard = LocalClientClockGuard::seal_new(hw, &raw_hw_secret)?;
         raw_hw_secret.zeroize();
 
-        let epoch_key = Self::derive_epoch_key(&root_cap, &custody.main.chain_id, 0);
+        let cached_epoch_key = Self::derive_epoch_key(&cached_root_cap, &custody.main.chain_id, 0);
         let spiral = SpiralSpace::new(config.space_dim, custody.auditor.spiral_coeffs);
 
         let mut cubes = Vec::with_capacity(config.mesh_size);
@@ -180,14 +192,14 @@ impl CellularMesh {
                     &(slot as u64).to_le_bytes(),
                 ],
             );
-            let cube = VoxelCube::generate_mesh_cube(&config, &root_cap, 0, &cube_seed)?;
-            coords.push(spiral.spiral_arm_coord(&epoch_key, 0, slot));
+            let cube = VoxelCube::generate_mesh_cube(&config, &cached_root_cap, 0, &cube_seed)?;
+            coords.push(spiral.spiral_arm_coord(&cached_epoch_key, 0, slot));
             cubes.push(cube);
         }
 
-        let decoy_seed = hmac_sha256_parts(&root_cap, &[b"decoy-root", &custody.main.chain_id]);
+        let decoy_seed =
+            hmac_sha256_parts(&cached_root_cap, &[b"decoy-root", &custody.main.chain_id]);
         let decoys = generate_decoy_cubes(&config, &decoy_seed, &cubes);
-        root_cap.zeroize();
 
         let init_dh_secret = hmac_sha256_parts(
             shared_mesh_seed,
@@ -212,6 +224,9 @@ impl CellularMesh {
                 peer_dh_pub: init_dh_pub,
                 chain_key: init_chain_key,
             },
+            cached_root_cap,
+            cached_epoch_key,
+            dh_rekey_interval: 1,
             epoch: 0,
             sequence: 0,
             pending_outbound: None,
@@ -278,6 +293,24 @@ impl CellularMesh {
         Ok(())
     }
 
+    /// Configures how frequently full X25519 DH + 25/20 cellular quorum mutation executes
+    /// (`1` = every message; `N > 1` runs X25519 + quorum kill/birth every `N` packets and
+    /// forward-secure `HybridTriMix` symmetric chain ratcheting on intermediate frames).
+    pub fn set_dh_rekey_interval(&mut self, interval: u64) {
+        self.dh_rekey_interval = interval.max(1);
+    }
+
+    /// Builder helper configuring the DH rekey cadence in packets.
+    pub fn with_dh_rekey_interval(mut self, interval: u64) -> Self {
+        self.set_dh_rekey_interval(interval);
+        self
+    }
+
+    /// Returns the configured DH rekey cadence (`1` = per-message X25519).
+    pub fn dh_rekey_interval(&self) -> u64 {
+        self.dh_rekey_interval
+    }
+
     /// Sends compact critical data (up to `core_bytes - 8` = `24` bytes in standard config)
     /// directly inside `UniqueWireCube::partial_256b` with TMR self-healing (`RawCore256` mode).
     ///
@@ -334,15 +367,27 @@ impl CellularMesh {
         }
 
         let next_peer_pub = ack.next_ratchet_pub;
-        let committed = self.pending_outbound.take().unwrap();
-        let next_chain_key = Self::advance_ratchet_chain_key(
-            &self.ratchet.chain_key,
-            &committed.dh_out,
-            &next_peer_pub,
-        );
-        self.apply_transition(committed);
+        let mut committed = self.pending_outbound.take().unwrap();
+        let next_chain_key = if committed.dh_step {
+            Self::advance_ratchet_chain_key(
+                &self.ratchet.chain_key,
+                &committed.dh_out,
+                &next_peer_pub,
+            )
+        } else {
+            Self::advance_fast_chain_key(
+                &self.ratchet.chain_key,
+                &committed.cube_fingerprint,
+                committed.next_sequence,
+                &committed.next_main_root,
+            )
+        };
+        let was_dh = committed.dh_step;
+        self.apply_transition(&mut committed);
         self.ratchet.chain_key = next_chain_key;
-        self.ratchet.peer_dh_pub = next_peer_pub;
+        if was_dh {
+            self.ratchet.peer_dh_pub = next_peer_pub;
+        }
         Ok(())
     }
 
@@ -376,25 +421,39 @@ impl CellularMesh {
             ));
         }
 
-        let mut root_cap = self
-            .custody
-            .derive_root_capability(self.config.fixed_step_budget);
-        let mut dh_out = match Self::dh_exchange(&self.ratchet.local_dh_secret, &packet.ratchet_pub)
-        {
-            Ok(s) => s,
-            Err(e) => {
-                root_cap.zeroize();
-                return Err(e);
+        let dh_step = self.is_dh_step(packet.sequence);
+        let mut dh_out = if dh_step {
+            Self::dh_exchange(&self.ratchet.local_dh_secret, &packet.ratchet_pub)?
+        } else {
+            if !constant_time_eq(&packet.ratchet_pub, &self.ratchet.local_dh_pub) {
+                return Err(CubeHashError::AuthenticationFailed);
             }
+            [0u8; 32]
         };
-        let mut ratcheted_root =
-            Self::derive_ratcheted_root(&root_cap, &self.ratchet.chain_key, &dh_out);
-        let algo = self.synthesize_ephemeral_algorithm(
-            &ratcheted_root,
-            &packet.wire_cube.cube_fingerprint,
-            packet.sequence,
-            packet.epoch,
-        );
+        let mut ratcheted_root = if dh_step {
+            Self::derive_ratcheted_root(&self.cached_root_cap, &self.ratchet.chain_key, &dh_out)
+        } else {
+            Self::derive_fast_ratcheted_root(
+                &self.cached_root_cap,
+                &self.ratchet.chain_key,
+                &packet.ratchet_pub,
+            )
+        };
+        let algo = if dh_step {
+            self.synthesize_ephemeral_algorithm(
+                &ratcheted_root,
+                &packet.wire_cube.cube_fingerprint,
+                packet.sequence,
+                packet.epoch,
+            )
+        } else {
+            self.synthesize_fast_ephemeral_algorithm(
+                &ratcheted_root,
+                &packet.wire_cube.cube_fingerprint,
+                packet.sequence,
+                packet.epoch,
+            )
+        };
 
         // 1. Self-heal the incoming wire cube BEFORE MAC verification (`Section 4.3`).
         let wire_tmr_key = Self::derive_wire_tmr_key(
@@ -405,23 +464,23 @@ impl CellularMesh {
         let mut wire_voxel = VoxelCube {
             cube_uid: packet.wire_cube.cube_fingerprint,
             generation: packet.sequence,
-            sub_matrix: packet.wire_cube.partial_1000b.clone(),
-            core_pattern: packet.wire_cube.partial_256b.clone(),
+            sub_matrix: std::mem::take(&mut packet.wire_cube.partial_1000b),
+            core_pattern: std::mem::take(&mut packet.wire_cube.partial_256b),
             weight_layer: Vec::new(),
         };
-        let heal_report = match wire_voxel.heal_bitwise(&wire_tmr_key) {
+        let heal_res = wire_voxel.heal_bitwise(&wire_tmr_key);
+        packet.wire_cube.partial_256b = std::mem::take(&mut wire_voxel.core_pattern);
+        packet.wire_cube.partial_1000b = std::mem::take(&mut wire_voxel.sub_matrix);
+        let heal_report = match heal_res {
             Ok(r) => r,
             Err(e) => {
-                root_cap.zeroize();
                 ratcheted_root.zeroize();
                 dh_out.zeroize();
                 return Err(e);
             }
         };
-        packet.wire_cube.partial_256b = wire_voxel.core_pattern.clone();
-        packet.wire_cube.partial_1000b = wire_voxel.sub_matrix.clone();
 
-        // 2. Verify packet MAC over healed wire cube + sequence + epoch + ratchet_pub + ciphertext.
+        // 2. Verify packet MAC over healed wire cube + sequence + epoch + ratchet_pub + ciphertext tag.
         let expected_mac = Self::compute_packet_mac(
             &algo.algo_key,
             &packet.wire_cube.cube_fingerprint,
@@ -432,7 +491,6 @@ impl CellularMesh {
             &packet.payload_mode,
         );
         if !constant_time_eq(&expected_mac, &packet.packet_mac) {
-            root_cap.zeroize();
             ratcheted_root.zeroize();
             dh_out.zeroize();
             return Err(CubeHashError::AuthenticationFailed);
@@ -442,21 +500,29 @@ impl CellularMesh {
         let (payload_ok, plaintext) =
             self.decrypt_payload_uniform(&algo.algo_key, packet, &packet.wire_cube.partial_256b);
         if payload_ok != 1 {
-            root_cap.zeroize();
             ratcheted_root.zeroize();
             dh_out.zeroize();
             return Err(CubeHashError::AuthenticationFailed);
         }
 
-        // 4. Stage, rotate local X25519 ratchet keypair, commit cellular transition, and emit DeliveryAck.
-        let (mut next_dh_sk, next_dh_pub) = Self::generate_dh_keypair()?;
-        let transition = self.build_transition(
-            &root_cap,
-            &algo,
-            packet.wire_cube.cube_fingerprint,
-            packet.sequence,
-            dh_out,
-        )?;
+        // 4. Stage, rotate receiver X25519 keypair on DH boundaries, commit transition, and emit DeliveryAck.
+        let (mut next_dh_sk, next_dh_pub) = if dh_step {
+            Self::generate_dh_keypair()?
+        } else {
+            ([0u8; 32], self.ratchet.local_dh_pub)
+        };
+        let mut transition = if dh_step {
+            let root_cap = self.cached_root_cap;
+            self.build_transition(
+                &root_cap,
+                &algo,
+                packet.wire_cube.cube_fingerprint,
+                packet.sequence,
+                dh_out,
+            )?
+        } else {
+            self.build_fast_transition(&algo, packet.wire_cube.cube_fingerprint, packet.sequence)
+        };
         let ack = DeliveryAck {
             cube_fingerprint: packet.wire_cube.cube_fingerprint,
             sequence: packet.sequence,
@@ -470,14 +536,13 @@ impl CellularMesh {
             ),
         };
         self.commit_receive_transition(
-            transition,
+            &mut transition,
             next_dh_sk,
             next_dh_pub,
             packet.ratchet_pub,
             &dh_out,
         );
         next_dh_sk.zeroize();
-        root_cap.zeroize();
         ratcheted_root.zeroize();
         dh_out.zeroize();
 
@@ -548,24 +613,45 @@ impl CellularMesh {
             .min(self.config.sub_matrix_bytes);
         norm_1000b[..s_copy].copy_from_slice(&packet.wire_cube.partial_1000b[..s_copy]);
 
-        let mut root_cap = self
-            .custody
-            .derive_root_capability(self.config.fixed_step_budget);
-        let (dh_ok, mut dh_out) =
+        let dh_step = self.is_dh_step(expected_seq);
+        let (dh_ok, mut dh_out) = if dh_step {
             match Self::dh_exchange(&self.ratchet.local_dh_secret, &packet.ratchet_pub) {
                 Ok(s) => (1u8, s),
                 Err(_) => (0u8, [0u8; 32]),
-            };
+            }
+        } else {
+            let match_pub = u8::from(constant_time_eq(
+                &packet.ratchet_pub,
+                &self.ratchet.local_dh_pub,
+            ));
+            (match_pub, [0u8; 32])
+        };
         authentic_mask &= dh_ok;
 
-        let mut ratcheted_root =
-            Self::derive_ratcheted_root(&root_cap, &self.ratchet.chain_key, &dh_out);
-        let algo = self.synthesize_ephemeral_algorithm(
-            &ratcheted_root,
-            &packet.wire_cube.cube_fingerprint,
-            packet.sequence,
-            packet.epoch,
-        );
+        let mut ratcheted_root = if dh_step {
+            Self::derive_ratcheted_root(&self.cached_root_cap, &self.ratchet.chain_key, &dh_out)
+        } else {
+            Self::derive_fast_ratcheted_root(
+                &self.cached_root_cap,
+                &self.ratchet.chain_key,
+                &packet.ratchet_pub,
+            )
+        };
+        let algo = if dh_step {
+            self.synthesize_ephemeral_algorithm(
+                &ratcheted_root,
+                &packet.wire_cube.cube_fingerprint,
+                packet.sequence,
+                packet.epoch,
+            )
+        } else {
+            self.synthesize_fast_ephemeral_algorithm(
+                &ratcheted_root,
+                &packet.wire_cube.cube_fingerprint,
+                packet.sequence,
+                packet.epoch,
+            )
+        };
 
         let wire_tmr_key = Self::derive_wire_tmr_key(
             &algo.algo_key,
@@ -600,16 +686,29 @@ impl CellularMesh {
             self.decrypt_payload_uniform(&algo.algo_key, packet, &wire_voxel.core_pattern);
         authentic_mask &= payload_ok;
 
-        let transition_res = self.build_transition(
-            &root_cap,
-            &algo,
-            packet.wire_cube.cube_fingerprint,
-            packet.sequence,
-            dh_out,
-        );
-        let (next_dh_ok, mut next_dh_sk, next_dh_pub) = match Self::generate_dh_keypair() {
-            Ok((sk, pk)) => (1u8, sk, pk),
-            Err(_) => (0u8, [0u8; 32], [0u8; 32]),
+        let transition_res = if dh_step {
+            let root_cap = self.cached_root_cap;
+            self.build_transition(
+                &root_cap,
+                &algo,
+                packet.wire_cube.cube_fingerprint,
+                packet.sequence,
+                dh_out,
+            )
+        } else {
+            Ok(self.build_fast_transition(
+                &algo,
+                packet.wire_cube.cube_fingerprint,
+                packet.sequence,
+            ))
+        };
+        let (next_dh_ok, mut next_dh_sk, next_dh_pub) = if dh_step {
+            match Self::generate_dh_keypair() {
+                Ok((sk, pk)) => (1u8, sk, pk),
+                Err(_) => (0u8, [0u8; 32], [0u8; 32]),
+            }
+        } else {
+            (1u8, [0u8; 32], self.ratchet.local_dh_pub)
         };
         authentic_mask &= next_dh_ok;
 
@@ -635,7 +734,7 @@ impl CellularMesh {
         );
 
         let outcome = if authentic_mask == 1 {
-            if let Ok(transition) = transition_res {
+            if let Ok(mut transition) = transition_res {
                 let ack = DeliveryAck {
                     cube_fingerprint: packet.wire_cube.cube_fingerprint,
                     sequence: packet.sequence,
@@ -645,7 +744,7 @@ impl CellularMesh {
                 };
                 self.clock_guard.local_monotonic_tick = candidate_tick;
                 self.commit_receive_transition(
-                    transition,
+                    &mut transition,
                     next_dh_sk,
                     next_dh_pub,
                     packet.ratchet_pub,
@@ -673,7 +772,6 @@ impl CellularMesh {
         };
 
         next_dh_sk.zeroize();
-        root_cap.zeroize();
         ratcheted_root.zeroize();
         dh_out.zeroize();
         outcome
@@ -727,15 +825,14 @@ impl CellularMesh {
     }
 
     fn apply_epoch_hop_internal(&mut self) -> Result<u64> {
-        let mut root_cap = self
-            .custody
-            .derive_root_capability(self.config.fixed_step_budget);
         let prev_epoch = self.epoch;
         let next_epoch = prev_epoch + 1;
-        let prev_epoch_key =
-            Self::derive_epoch_key(&root_cap, &self.custody.main.chain_id, prev_epoch);
-        let next_epoch_key =
-            Self::derive_epoch_key(&root_cap, &self.custody.main.chain_id, next_epoch);
+        let prev_epoch_key = self.cached_epoch_key;
+        let next_epoch_key = Self::derive_epoch_key(
+            &self.cached_root_cap,
+            &self.custody.main.chain_id,
+            next_epoch,
+        );
         let spiral = SpiralSpace::new(self.config.space_dim, self.custody.auditor.spiral_coeffs);
 
         for (slot, coord) in self.coords.iter_mut().enumerate() {
@@ -749,7 +846,7 @@ impl CellularMesh {
         }
 
         self.epoch = next_epoch;
-        root_cap.zeroize();
+        self.cached_epoch_key = next_epoch_key;
         Ok(next_epoch)
     }
 
@@ -766,13 +863,8 @@ impl CellularMesh {
                 "cube slot index out of bounds",
             ));
         }
-        let mut root_cap = self
-            .custody
-            .derive_root_capability(self.config.fixed_step_budget);
-        let epoch_key = Self::derive_epoch_key(&root_cap, &self.custody.main.chain_id, self.epoch);
-        let res = self.cubes[slot].heal_at_epoch(&root_cap, Some((&epoch_key, self.epoch)));
-        root_cap.zeroize();
-        res
+        let epoch_key = self.cached_epoch_key;
+        self.cubes[slot].heal_at_epoch(&self.cached_root_cap, Some((&epoch_key, self.epoch)))
     }
 
     /// Mutable reference to stored cubes for fault-injection and bit-rot testing.
@@ -786,21 +878,15 @@ impl CellularMesh {
         start_slot: usize,
         target: Coord3D,
     ) -> (Option<usize>, usize) {
-        let mut root_cap = self
-            .custody
-            .derive_root_capability(self.config.fixed_step_budget);
-        let epoch_key = Self::derive_epoch_key(&root_cap, &self.custody.main.chain_id, self.epoch);
         let spiral = SpiralSpace::new(self.config.space_dim, self.custody.auditor.spiral_coeffs);
-        let res = spiral.search_spiral_window(
+        spiral.search_spiral_window(
             &self.coords,
-            &epoch_key,
+            &self.cached_epoch_key,
             self.epoch,
             start_slot,
             self.config.spiral_window,
             target,
-        );
-        root_cap.zeroize();
-        res
+        )
     }
 
     /// Re-seals the local hardware clock guard onto replacement hardware using 3-Cube Custody (`Section 3.1`).
@@ -810,6 +896,14 @@ impl CellularMesh {
             .recover_on_new_hardware(new_hw, self.config.fixed_step_budget)?;
         new_guard.local_monotonic_tick = self.clock_guard.local_monotonic_tick;
         self.clock_guard = new_guard;
+        self.cached_root_cap = self
+            .custody
+            .derive_root_capability(self.config.fixed_step_budget);
+        self.cached_epoch_key = Self::derive_epoch_key(
+            &self.cached_root_cap,
+            &self.custody.main.chain_id,
+            self.epoch,
+        );
         Ok(())
     }
 
@@ -873,6 +967,10 @@ impl CellularMesh {
         &mut self.clock_guard
     }
 
+    fn is_dh_step(&self, seq: u64) -> bool {
+        seq.saturating_sub(1).is_multiple_of(self.dh_rekey_interval)
+    }
+
     fn begin_send_inner(
         &mut self,
         hw: &dyn HardwareProvider,
@@ -885,34 +983,70 @@ impl CellularMesh {
         let _exec_token = self.clock_guard.authorize_local_execution(hw)?;
 
         let next_seq = self.sequence + 1;
+        let dh_step = self.is_dh_step(next_seq);
+
+        // Single OS CSPRNG syscall expanded via BLAKE2b512 whitened stream for packet randomness.
+        let mut rng_seed = [0u8; 32];
+        fill_random(&mut rng_seed)?;
+        let mut entropy = [0u8; 224];
+        whitened_stream(&rng_seed, b"pkt-entropy-v2", &mut entropy);
+        rng_seed.zeroize();
+
         let mut cube_fingerprint = [0u8; FINGERPRINT_BYTES];
-        fill_random(&mut cube_fingerprint)?;
+        cube_fingerprint.copy_from_slice(&entropy[..16]);
 
-        let (mut eph_sk, ratchet_pub) = Self::generate_dh_keypair()?;
-        let mut dh_out = match Self::dh_exchange(&eph_sk, &self.ratchet.peer_dh_pub) {
-            Ok(s) => s,
-            Err(e) => {
-                eph_sk.zeroize();
-                return Err(e);
-            }
+        let (ratchet_pub, mut dh_out) = if dh_step {
+            let mut eph_sk = [0u8; 32];
+            eph_sk.copy_from_slice(&entropy[16..48]);
+            let secret = StaticSecret::from(eph_sk);
+            let pub_bytes = PublicKey::from(&secret).to_bytes();
+            let dh = match Self::dh_exchange(&eph_sk, &self.ratchet.peer_dh_pub) {
+                Ok(s) => s,
+                Err(e) => {
+                    eph_sk.zeroize();
+                    entropy.zeroize();
+                    return Err(e);
+                }
+            };
+            eph_sk.zeroize();
+            (pub_bytes, dh)
+        } else {
+            (self.ratchet.peer_dh_pub, [0u8; 32])
         };
-        eph_sk.zeroize();
 
-        let mut root_cap = self
-            .custody
-            .derive_root_capability(self.config.fixed_step_budget);
-        let mut ratcheted_root =
-            Self::derive_ratcheted_root(&root_cap, &self.ratchet.chain_key, &dh_out);
-        let algo = self.synthesize_ephemeral_algorithm(
-            &ratcheted_root,
-            &cube_fingerprint,
-            next_seq,
-            self.epoch,
-        );
+        let mut ratcheted_root = if dh_step {
+            Self::derive_ratcheted_root(&self.cached_root_cap, &self.ratchet.chain_key, &dh_out)
+        } else {
+            Self::derive_fast_ratcheted_root(
+                &self.cached_root_cap,
+                &self.ratchet.chain_key,
+                &ratchet_pub,
+            )
+        };
+        let algo = if dh_step {
+            self.synthesize_ephemeral_algorithm(
+                &ratcheted_root,
+                &cube_fingerprint,
+                next_seq,
+                self.epoch,
+            )
+        } else {
+            self.synthesize_fast_ephemeral_algorithm(
+                &ratcheted_root,
+                &cube_fingerprint,
+                next_seq,
+                self.epoch,
+            )
+        };
 
-        let mut plain_core = vec![0u8; self.config.core_bytes];
-        fill_random(&mut plain_core)?;
+        let core_len = self.config.core_bytes;
+        let mut plain_core_buf = [0u8; 128];
+        plain_core_buf[..core_len].copy_from_slice(&entropy[48..48 + core_len]);
+        let mut weight_seed = [0u8; 32];
+        weight_seed.copy_from_slice(&entropy[176..208]);
+        entropy.zeroize();
 
+        let plain_core = &mut plain_core_buf[..core_len];
         let payload_mode = if raw_core_mode {
             let len_bytes = (payload.len() as u16).to_le_bytes();
             plain_core[0] = len_bytes[0];
@@ -924,7 +1058,6 @@ impl CellularMesh {
             plain_core[8..8 + payload.len()].copy_from_slice(payload);
             PayloadMode::RawCore256
         } else {
-            // `plain_core[8..]` holds CSPRNG nonce seed (works for any `core_bytes >= 16`).
             plain_core[2] = CORE_FLAG_AEAD;
             let mut nonce = [0u8; 24];
             hkdf_expand_label(
@@ -947,14 +1080,18 @@ impl CellularMesh {
             PayloadMode::ArbitraryCiphertext { ciphertext }
         };
 
-        let mut core_mask = vec![0u8; self.config.core_bytes];
-        whitened_stream(&algo.algo_key, b"wire-core-mask", &mut core_mask);
-        let mut partial_256b = vec![0u8; self.config.core_bytes];
-        for i in 0..self.config.core_bytes {
-            partial_256b[i] = plain_core[i] ^ core_mask[i];
+        let mut core_mask_buf = [0u8; 128];
+        whitened_stream(
+            &algo.algo_key,
+            b"wire-core-mask",
+            &mut core_mask_buf[..core_len],
+        );
+        let mut partial_256b = vec![0u8; core_len];
+        for i in 0..core_len {
+            partial_256b[i] = plain_core[i] ^ core_mask_buf[i];
         }
-        core_mask.zeroize();
-        plain_core.zeroize();
+        core_mask_buf[..core_len].zeroize();
+        plain_core_buf[..core_len].zeroize();
 
         let wire_tmr_key = Self::derive_wire_tmr_key(&algo.algo_key, &cube_fingerprint, next_seq);
         let partial_1000b = encode_sub_matrix_with_shadows(
@@ -964,7 +1101,8 @@ impl CellularMesh {
             next_seq,
             &partial_256b,
         );
-        let weight_padding = generate_variable_weight(&self.config)?;
+        let weight_padding = generate_variable_weight_seeded(&self.config, &weight_seed);
+        weight_seed.zeroize();
         let packet_mac = Self::compute_packet_mac(
             &algo.algo_key,
             &cube_fingerprint,
@@ -975,10 +1113,13 @@ impl CellularMesh {
             &payload_mode,
         );
 
-        let pending =
-            self.build_transition(&root_cap, &algo, cube_fingerprint, next_seq, dh_out)?;
+        let pending = if dh_step {
+            let root_cap = self.cached_root_cap;
+            self.build_transition(&root_cap, &algo, cube_fingerprint, next_seq, dh_out)?
+        } else {
+            self.build_fast_transition(&algo, cube_fingerprint, next_seq)
+        };
         self.pending_outbound = Some(pending);
-        root_cap.zeroize();
         ratcheted_root.zeroize();
         dh_out.zeroize();
 
@@ -1009,13 +1150,15 @@ impl CellularMesh {
         let ratchet_pub = &packet.ratchet_pub;
         let payload_mode = &packet.payload_mode;
 
-        let mut core_mask = vec![0u8; self.config.core_bytes];
-        whitened_stream(algo_key, b"wire-core-mask", &mut core_mask);
-        let mut plain_core = vec![0u8; self.config.core_bytes];
-        for i in 0..self.config.core_bytes {
-            plain_core[i] = healed_core[i] ^ core_mask[i];
+        let core_len = self.config.core_bytes;
+        let mut core_mask_buf = [0u8; 128];
+        whitened_stream(algo_key, b"wire-core-mask", &mut core_mask_buf[..core_len]);
+        let mut plain_core_buf = [0u8; 128];
+        for i in 0..core_len {
+            plain_core_buf[i] = healed_core[i] ^ core_mask_buf[i];
         }
-        core_mask.zeroize();
+        core_mask_buf[..core_len].zeroize();
+        let plain_core = &plain_core_buf[..core_len];
 
         let result = match payload_mode {
             PayloadMode::RawCore256 => {
@@ -1065,8 +1208,45 @@ impl CellularMesh {
             }
         };
 
-        plain_core.zeroize();
+        plain_core_buf[..core_len].zeroize();
         result
+    }
+
+    fn synthesize_fast_ephemeral_algorithm(
+        &self,
+        ratcheted_root: &[u8; 32],
+        fingerprint: &[u8; FINGERPRINT_BYTES],
+        sequence: u64,
+        epoch: u64,
+    ) -> EphemeralCubeAlgorithm {
+        let len = self.cubes.len();
+        let slot_a = (sequence as usize) % len;
+        let slot_b = ((sequence as usize).wrapping_mul(37).wrapping_add(13)) % len;
+        let mut msg = [0u8; 128];
+        let mut off = 0usize;
+        msg[off..off + 16].copy_from_slice(fingerprint);
+        off += 16;
+        msg[off..off + 8].copy_from_slice(&sequence.to_le_bytes());
+        off += 8;
+        msg[off..off + 8].copy_from_slice(&epoch.to_le_bytes());
+        off += 8;
+        msg[off..off + 32].copy_from_slice(&self.custody.main.active_chain_state);
+        off += 32;
+        let take_a = self.cubes[slot_a].core_pattern.len().min(32);
+        msg[off..off + take_a].copy_from_slice(&self.cubes[slot_a].core_pattern[..take_a]);
+        off += take_a;
+        let take_b = self.cubes[slot_b].core_pattern.len().min(32);
+        msg[off..off + take_b].copy_from_slice(&self.cubes[slot_b].core_pattern[..take_b]);
+        off += take_b;
+
+        let algo_key = HybridTriMix::mix_256(ratcheted_root, b"fast-sym-algo-v2", &msg[..off], 1);
+        msg.zeroize();
+
+        EphemeralCubeAlgorithm {
+            algo_key,
+            rotation_profile: Vec::new(),
+            selected_indices: vec![slot_a, slot_b],
+        }
     }
 
     fn synthesize_ephemeral_algorithm(
@@ -1087,10 +1267,36 @@ impl CellularMesh {
             ],
         );
 
-        let mut indices: Vec<usize> = (0..self.config.mesh_size).collect();
-        let mut stream = vec![0u8; self.config.mesh_size * 4];
-        whitened_stream(&sel_seed, b"quorum-perm", &mut stream);
-        for i in (1..indices.len()).rev() {
+        let n = self.config.mesh_size;
+        let mut indices_stack = [0usize; 256];
+        let mut indices_heap = if n > 256 {
+            (0..n).collect::<Vec<usize>>()
+        } else {
+            for (i, slot) in indices_stack[..n].iter_mut().enumerate() {
+                *slot = i;
+            }
+            Vec::new()
+        };
+        let indices: &mut [usize] = if n > 256 {
+            &mut indices_heap
+        } else {
+            &mut indices_stack[..n]
+        };
+
+        let stream_len = n * 4;
+        let mut stream_stack = [0u8; 1024];
+        let mut stream_heap = if stream_len > 1024 {
+            vec![0u8; stream_len]
+        } else {
+            Vec::new()
+        };
+        let stream: &mut [u8] = if stream_len > 1024 {
+            &mut stream_heap
+        } else {
+            &mut stream_stack[..stream_len]
+        };
+        whitened_stream(&sel_seed, b"quorum-perm", stream);
+        for i in (1..n).rev() {
             let off = i * 4;
             let r = u32::from_le_bytes([
                 stream[off],
@@ -1103,7 +1309,7 @@ impl CellularMesh {
         }
         let selected_indices = indices[..self.config.quorum_select].to_vec();
 
-        // Gather canonical core patterns from the selected 25 cubes to feed ephemeral synthesis.
+        // Gather canonical core patterns from the selected cubes cleanly.
         let mut quorum_material = Vec::with_capacity(
             self.config.quorum_select * self.config.core_bytes + FINGERPRINT_BYTES + 48,
         );
@@ -1124,8 +1330,19 @@ impl CellularMesh {
         );
         quorum_material.zeroize();
 
-        let mut rot_stream = vec![0u8; self.config.quorum_select * 4];
-        whitened_stream(&algo_key, b"rot-profile", &mut rot_stream);
+        let rot_len = self.config.quorum_select * 4;
+        let mut rot_stack = [0u8; 512];
+        let mut rot_heap = if rot_len > 512 {
+            vec![0u8; rot_len]
+        } else {
+            Vec::new()
+        };
+        let rot_stream: &mut [u8] = if rot_len > 512 {
+            &mut rot_heap
+        } else {
+            &mut rot_stack[..rot_len]
+        };
+        whitened_stream(&algo_key, b"rot-profile", rot_stream);
         let mut rotation_profile = Vec::with_capacity(self.config.quorum_select);
         for i in 0..self.config.quorum_select {
             let off = i * 4;
@@ -1144,6 +1361,26 @@ impl CellularMesh {
         }
     }
 
+    fn build_fast_transition(
+        &self,
+        algo: &EphemeralCubeAlgorithm,
+        fingerprint: [u8; FINGERPRINT_BYTES],
+        next_sequence: u64,
+    ) -> PendingTransition {
+        let ack_mac_key = hmac_sha256_parts(&algo.algo_key, &[b"delivery-ack-key-v2"]);
+        PendingTransition {
+            cube_fingerprint: fingerprint,
+            next_sequence,
+            kill_idx: 0,
+            born_cube: None,
+            born_coord: Coord3D { x: 0, y: 0, z: 0 },
+            next_main_root: algo.algo_key,
+            ack_mac_key,
+            dh_out: [0u8; 32],
+            dh_step: false,
+        }
+    }
+
     fn build_transition(
         &self,
         root_cap: &[u8; 32],
@@ -1153,15 +1390,25 @@ impl CellularMesh {
         dh_out: [u8; 32],
     ) -> Result<PendingTransition> {
         let consume_count = self.config.consume_for_next;
-        let consumed_slices: Vec<&[u8]> = algo.selected_indices[..consume_count]
-            .iter()
-            .map(|&idx| self.cubes[idx].core_pattern.as_slice())
-            .collect();
+        let mut consumed_stack = [&[][..]; 64];
+        let consumed_heap: Vec<&[u8]>;
+        let consumed_slices: &[&[u8]] = if consume_count <= 64 {
+            for (i, &idx) in algo.selected_indices[..consume_count].iter().enumerate() {
+                consumed_stack[i] = self.cubes[idx].core_pattern.as_slice();
+            }
+            &consumed_stack[..consume_count]
+        } else {
+            consumed_heap = algo.selected_indices[..consume_count]
+                .iter()
+                .map(|&idx| self.cubes[idx].core_pattern.as_slice())
+                .collect();
+            &consumed_heap
+        };
 
         let mut next_seed = combine_non_linear(
             self.custody.auditor.combining_fn,
             &algo.algo_key,
-            &consumed_slices,
+            consumed_slices,
             self.config.fixed_step_budget,
         );
 
@@ -1176,7 +1423,7 @@ impl CellularMesh {
 
         let mut born_cube =
             VoxelCube::generate_mesh_cube(&self.config, root_cap, next_sequence, &next_seed)?;
-        let epoch_key = Self::derive_epoch_key(root_cap, &self.custody.main.chain_id, self.epoch);
+        let epoch_key = self.cached_epoch_key;
         if self.epoch > 0 {
             SpiralSpace::permute_nibbles(&mut born_cube.sub_matrix, &epoch_key, self.epoch);
         }
@@ -1198,38 +1445,50 @@ impl CellularMesh {
             cube_fingerprint: fingerprint,
             next_sequence,
             kill_idx,
-            born_cube,
+            born_cube: Some(born_cube),
             born_coord,
             next_main_root,
             ack_mac_key,
             dh_out,
+            dh_step: true,
         })
     }
 
-    fn apply_transition(&mut self, mut t: PendingTransition) {
-        self.cubes[t.kill_idx] = t.born_cube.clone();
-        self.coords[t.kill_idx] = t.born_coord;
-        self.custody.main.active_chain_state = t.next_main_root;
-        self.custody.main.generation = t.next_sequence;
+    fn apply_transition(&mut self, t: &mut PendingTransition) {
+        if let Some(ref mut born) = t.born_cube {
+            std::mem::swap(&mut self.cubes[t.kill_idx], born);
+            self.coords[t.kill_idx] = t.born_coord;
+            self.custody.main.active_chain_state = t.next_main_root;
+            self.custody.main.generation = t.next_sequence;
+            born.zeroize();
+        }
         self.sequence = t.next_sequence;
-        t.born_cube.zeroize();
     }
 
     fn commit_receive_transition(
         &mut self,
-        t: PendingTransition,
+        t: &mut PendingTransition,
         next_local_sk: [u8; 32],
         next_local_pub: [u8; 32],
         sender_ratchet_pub: [u8; 32],
         dh_out: &[u8; 32],
     ) {
+        let was_dh = t.dh_step;
+        let fp = t.cube_fingerprint;
+        let next_seq = t.next_sequence;
+        let algo_k = t.next_main_root;
         self.apply_transition(t);
-        self.ratchet.chain_key =
-            Self::advance_ratchet_chain_key(&self.ratchet.chain_key, dh_out, &next_local_pub);
-        self.ratchet.local_dh_secret.zeroize();
-        self.ratchet.local_dh_secret = next_local_sk;
-        self.ratchet.local_dh_pub = next_local_pub;
-        self.ratchet.peer_dh_pub = sender_ratchet_pub;
+        if was_dh {
+            self.ratchet.chain_key =
+                Self::advance_ratchet_chain_key(&self.ratchet.chain_key, dh_out, &next_local_pub);
+            self.ratchet.local_dh_secret.zeroize();
+            self.ratchet.local_dh_secret = next_local_sk;
+            self.ratchet.local_dh_pub = next_local_pub;
+            self.ratchet.peer_dh_pub = sender_ratchet_pub;
+        } else {
+            self.ratchet.chain_key =
+                Self::advance_fast_chain_key(&self.ratchet.chain_key, &fp, next_seq, &algo_k);
+        }
     }
 
     fn generate_dh_keypair() -> Result<([u8; 32], [u8; 32])> {
@@ -1258,12 +1517,37 @@ impl CellularMesh {
         hmac_sha256_parts(root_cap, &[b"dh-ratchet-root-v1", chain_key, dh_out])
     }
 
+    fn derive_fast_ratcheted_root(
+        root_cap: &[u8; 32],
+        chain_key: &[u8; 32],
+        peer_pub: &[u8; 32],
+    ) -> [u8; 32] {
+        hmac_sha256_parts(root_cap, &[b"sym-ratchet-root-v2", chain_key, peer_pub])
+    }
+
     fn advance_ratchet_chain_key(
         chain_key: &[u8; 32],
         dh_out: &[u8; 32],
         next_pub: &[u8; 32],
     ) -> [u8; 32] {
         hmac_sha256_parts(chain_key, &[b"dh-ratchet-chain-v1", dh_out, next_pub])
+    }
+
+    fn advance_fast_chain_key(
+        chain_key: &[u8; 32],
+        fingerprint: &[u8; FINGERPRINT_BYTES],
+        next_seq: u64,
+        algo_key: &[u8; 32],
+    ) -> [u8; 32] {
+        hmac_sha256_parts(
+            chain_key,
+            &[
+                b"sym-chain-advance-v2",
+                fingerprint,
+                &next_seq.to_le_bytes(),
+                algo_key,
+            ],
+        )
     }
 
     fn compute_ack_mac(
@@ -1330,18 +1614,29 @@ impl CellularMesh {
                     partial_256b,
                 ],
             ),
-            PayloadMode::ArbitraryCiphertext { ciphertext } => hmac_sha256_parts(
-                algo_key,
-                &[
-                    b"wire-mac-aead-v2",
-                    fingerprint,
-                    &seq.to_le_bytes(),
-                    &epoch.to_le_bytes(),
-                    ratchet_pub,
-                    partial_256b,
-                    ciphertext,
-                ],
-            ),
+            PayloadMode::ArbitraryCiphertext { ciphertext } => {
+                // Authenticate header + healed partial_256b + ciphertext length + trailing 16B Poly1305 tag
+                // (or full body if shorter than 16B) so wire verification avoids double-scanning huge payloads
+                // while XChaCha20-Poly1305 enforces full-ciphertext INT-CTXT verification.
+                let tail = if ciphertext.len() >= 16 {
+                    &ciphertext[ciphertext.len() - 16..]
+                } else {
+                    ciphertext.as_slice()
+                };
+                hmac_sha256_parts(
+                    algo_key,
+                    &[
+                        b"wire-mac-aead-tag-v3",
+                        fingerprint,
+                        &seq.to_le_bytes(),
+                        &epoch.to_le_bytes(),
+                        ratchet_pub,
+                        partial_256b,
+                        &(ciphertext.len() as u64).to_le_bytes(),
+                        tail,
+                    ],
+                )
+            }
         }
     }
 }
@@ -1367,6 +1662,12 @@ impl DuplexCubeSession {
         let (b_tx, a_rx) =
             CellularMesh::new_paired(config, bob_to_alice_custody, bob_hw, alice_hw)?;
         Ok((Self { tx: a_tx, rx: a_rx }, Self { tx: b_tx, rx: b_rx }))
+    }
+
+    /// Configures the DH rekey cadence in packets on both TX and RX meshes (`1` = every message).
+    pub fn set_dh_rekey_interval(&mut self, interval: u64) {
+        self.tx.set_dh_rekey_interval(interval);
+        self.rx.set_dh_rekey_interval(interval);
     }
 
     /// Initiates sending arbitrary data over the TX mesh (awaiting `commit_ack` / `rollback_outbound`).
