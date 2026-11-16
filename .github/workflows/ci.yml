@@ -1,0 +1,73 @@
+name: CI Gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-and-safety:
+    name: Format, Clippy & Unsafe Guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify #![forbid(unsafe_code)] in cubehash-core
+        run: |
+          head -n 5 crates/cubehash-core/src/lib.rs | grep -q '#!\[forbid(unsafe_code)\]'
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test-suite:
+    name: Test Suite (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run workspace test suite
+        run: cargo test --workspace --locked
+
+  audit-and-ffi:
+    name: Release Audit & FFI Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build cubehash-ffi (cdylib + staticlib)
+        run: cargo build --release --locked -p cubehash-ffi
+      - name: Run 7-stage cryptographic audit CLI
+        run: cargo run --release --locked -p cubehash-cli
+
+  ci-gate:
+    name: CI Gate
+    needs: [lint-and-safety, test-suite, audit-and-ffi]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate required status checks
+        run: |
+          if [ "${{ needs.lint-and-safety.result }}" != "success" ] || \
+             [ "${{ needs.test-suite.result }}" != "success" ] || \
+             [ "${{ needs.audit-and-ffi.result }}" != "success" ]; then
+            exit 1
+          fi
+          echo "All CI Gate checks passed."

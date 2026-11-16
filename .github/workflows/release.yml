@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-artifacts:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: windows-latest
+            target: windows-x86_64
+          - os: macos-latest
+            target: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify tests before packaging
+        run: cargo test --workspace --locked
+      - name: Build release CLI & FFI
+        run: cargo build --release --locked -p cubehash-cli -p cubehash-ffi
+      - name: Stage release bundle (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          PKG="cubehash-${TAG}-${{ matrix.target }}"
+          mkdir -p "dist/${PKG}/include" "dist/${PKG}/lib" "dist/${PKG}/docs"
+          cp target/release/cubehash-cli "dist/${PKG}/"
+          cp crates/cubehash-ffi/include/cubehash.h "dist/${PKG}/include/"
+          for ext in so dylib a; do
+            for f in target/release/libcubehash_ffi.${ext}; do
+              [ -e "$f" ] && cp "$f" "dist/${PKG}/lib/"
+            done
+          done
+          cp README.md LICENSE-MIT LICENSE-APACHE SECURITY.md CHANGELOG.md "dist/${PKG}/"
+          cp docs/*.md "dist/${PKG}/docs/"
+          tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
+      - name: Stage release bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $pkg = "cubehash-$tag-windows-x86_64"
+          $out = "dist/$pkg"
+          New-Item -ItemType Directory -Path "$out/include", "$out/lib", "$out/docs" -Force | Out-Null
+          Copy-Item "target/release/cubehash-cli.exe" "$out/"
+          Copy-Item "crates/cubehash-ffi/include/cubehash.h" "$out/include/"
+          Copy-Item "target/release/cubehash_ffi.dll", "target/release/cubehash_ffi.dll.lib", "target/release/cubehash_ffi.lib" "$out/lib/"
+          Copy-Item "README.md", "LICENSE-MIT", "LICENSE-APACHE", "SECURITY.md", "CHANGELOG.md" "$out/"
+          Copy-Item "docs/*.md" "$out/docs/"
+          Compress-Archive -Path $out -DestinationPath "dist/$pkg.zip" -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [build-artifacts]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Compute SHA256SUMS
+        run: |
+          cd artifacts
+          sha256sum cubehash-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
