@@ -8,5 +8,3 @@ description = "Security audit, fault-injection, adversarial verification, and be
 
 [dependencies]
 cubehash-core = { path = "../cubehash-core" }
-hex.workspace = true
-serde_json.workspace = true

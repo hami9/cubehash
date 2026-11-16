@@ -260,8 +260,8 @@ fn test_bitwise_majority_voting_self_healing_wire_and_storage() {
         ruined_pkt.wire_cube.partial_1000b[i] ^= 0xFF;
         ruined_pkt.wire_cube.partial_1000b[32 + i] ^= 0xFF;
     }
-    for i in 64..72 {
-        ruined_pkt.wire_cube.partial_1000b[i] ^= 0xFF;
+    for b in &mut ruined_pkt.wire_cube.partial_1000b[64..72] {
+        *b ^= 0xFF;
     }
     assert_eq!(
         bob.receive_authenticated(&bob_hw, &mut ruined_pkt),
