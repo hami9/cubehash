@@ -197,7 +197,13 @@ pub fn combine_non_linear(
         }
     }
     // Final fixed-budget whitening pass across the accumulator.
-    fixed_budget_mix(TimeAlgorithm::HybridTriMix, algo_key, b"combine-final", &acc, budget)
+    fixed_budget_mix(
+        TimeAlgorithm::HybridTriMix,
+        algo_key,
+        b"combine-final",
+        &acc,
+        budget,
+    )
 }
 
 /// Encrypts arbitrary-length plaintext with `XChaCha20-Poly1305` and explicit AAD.
@@ -209,7 +215,13 @@ pub fn aead_seal(
 ) -> Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new(key.into());
     cipher
-        .encrypt(XNonce::from_slice(nonce), Payload { msg: plaintext, aad })
+        .encrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| CubeHashError::CryptoFailure("aead encryption failed"))
 }
 
@@ -222,7 +234,13 @@ pub fn aead_open(
 ) -> Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new(key.into());
     cipher
-        .decrypt(XNonce::from_slice(nonce), Payload { msg: ciphertext, aad })
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|_| CubeHashError::AuthenticationFailed)
 }
 

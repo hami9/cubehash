@@ -142,7 +142,9 @@ impl MeshConfig {
             ));
         }
         if self.space_dim < 16 {
-            return Err(CubeHashError::InvalidConfig("space_dim must be at least 16"));
+            return Err(CubeHashError::InvalidConfig(
+                "space_dim must be at least 16",
+            ));
         }
         if self.spiral_window == 0 {
             return Err(CubeHashError::InvalidConfig(

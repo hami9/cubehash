@@ -177,10 +177,7 @@ fn test_ffi_full_lifecycle_and_zero_oracle() {
             std::slice::from_raw_parts(data2.ptr, data2.len),
             b"after-ffi-hop"
         );
-        assert_eq!(
-            cubehash_commit_ack(alice, ack2.ptr, ack2.len),
-            CUBEHASH_OK
-        );
+        assert_eq!(cubehash_commit_ack(alice, ack2.ptr, ack2.len), CUBEHASH_OK);
         cubehash_buffer_free(msg2_pkt);
         cubehash_buffer_free(data2);
         cubehash_buffer_free(ack2);
@@ -189,8 +186,12 @@ fn test_ffi_full_lifecycle_and_zero_oracle() {
             ptr: std::ptr::null_mut(),
             len: 0,
         };
-        assert_eq!(cubehash_audit_stats_json(alice, &mut stats_buf), CUBEHASH_OK);
-        let stats_str = std::str::from_utf8(std::slice::from_raw_parts(stats_buf.ptr, stats_buf.len)).unwrap();
+        assert_eq!(
+            cubehash_audit_stats_json(alice, &mut stats_buf),
+            CUBEHASH_OK
+        );
+        let stats_str =
+            std::str::from_utf8(std::slice::from_raw_parts(stats_buf.ptr, stats_buf.len)).unwrap();
         assert!(stats_str.contains("\"mesh_size\":100"));
         let _ = CStr::from_bytes_with_nul;
         cubehash_buffer_free(stats_buf);

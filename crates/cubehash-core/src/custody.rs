@@ -51,7 +51,10 @@ impl VirtualHardwareEnclave {
     }
 
     fn sealing_pad(&self, label: &[u8]) -> [u8; 32] {
-        hmac_sha256_parts(&self.enclave_root_key, &[b"cubehash-hw-seal", &self.hw_id, label])
+        hmac_sha256_parts(
+            &self.enclave_root_key,
+            &[b"cubehash-hw-seal", &self.hw_id, label],
+        )
     }
 }
 
@@ -346,9 +349,13 @@ impl AuditorCube {
         fill_random(&mut synthesis_salt)?;
         fill_random(&mut coeff_raw)?;
 
-        let c0 = (u32::from_le_bytes([coeff_raw[0], coeff_raw[1], coeff_raw[2], coeff_raw[3]]) % 97) + 3;
-        let c1 = (u32::from_le_bytes([coeff_raw[4], coeff_raw[5], coeff_raw[6], coeff_raw[7]]) % 97) + 5;
-        let c2 = (u32::from_le_bytes([coeff_raw[8], coeff_raw[9], coeff_raw[10], coeff_raw[11]]) % 97) + 7;
+        let c0 =
+            (u32::from_le_bytes([coeff_raw[0], coeff_raw[1], coeff_raw[2], coeff_raw[3]]) % 97) + 3;
+        let c1 =
+            (u32::from_le_bytes([coeff_raw[4], coeff_raw[5], coeff_raw[6], coeff_raw[7]]) % 97) + 5;
+        let c2 = (u32::from_le_bytes([coeff_raw[8], coeff_raw[9], coeff_raw[10], coeff_raw[11]])
+            % 97)
+            + 7;
 
         Ok(Self {
             auditor_secret,
@@ -416,7 +423,9 @@ impl ThreeCubeCustody {
 
     /// Synthesizes the root custody capability using all three cubes under a fixed step budget.
     pub fn derive_root_capability(&self, budget: usize) -> [u8; 32] {
-        let mut mother_part = self.mother.derive_domain_key(b"3cube-root", &self.main.chain_id);
+        let mut mother_part = self
+            .mother
+            .derive_domain_key(b"3cube-root", &self.main.chain_id);
         let mut combined_ctx = Vec::with_capacity(64);
         combined_ctx.extend_from_slice(&self.main.root_pattern);
         combined_ctx.extend_from_slice(&self.auditor.synthesis_salt);
@@ -441,7 +450,8 @@ impl ThreeCubeCustody {
         budget: usize,
     ) -> Result<(LocalClientClockGuard, [u8; 32])> {
         let mut root_cap = self.derive_root_capability(budget);
-        let hw_secret = hmac_sha256_parts(&root_cap, &[b"recover-hw-secret", &new_hw.device_hw_id()]);
+        let hw_secret =
+            hmac_sha256_parts(&root_cap, &[b"recover-hw-secret", &new_hw.device_hw_id()]);
         let guard = LocalClientClockGuard::seal_new(new_hw, &hw_secret)?;
         let recovery_epoch_key =
             hmac_sha256_parts(&root_cap, &[b"recover-epoch", &self.main.chain_id]);

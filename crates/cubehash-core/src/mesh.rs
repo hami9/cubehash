@@ -174,7 +174,11 @@ impl CellularMesh {
         for slot in 0..config.mesh_size {
             let cube_seed = hmac_sha256_parts(
                 shared_mesh_seed,
-                &[b"init-mesh-cube", &custody.main.chain_id, &(slot as u64).to_le_bytes()],
+                &[
+                    b"init-mesh-cube",
+                    &custody.main.chain_id,
+                    &(slot as u64).to_le_bytes(),
+                ],
             );
             let cube = VoxelCube::generate_mesh_cube(&config, &root_cap, 0, &cube_seed)?;
             coords.push(spiral.spiral_arm_coord(&epoch_key, 0, slot));
@@ -185,11 +189,15 @@ impl CellularMesh {
         let decoys = generate_decoy_cubes(&config, &decoy_seed, &cubes);
         root_cap.zeroize();
 
-        let init_dh_secret =
-            hmac_sha256_parts(shared_mesh_seed, &[b"init-dh-ratchet-sk", &custody.main.chain_id]);
+        let init_dh_secret = hmac_sha256_parts(
+            shared_mesh_seed,
+            &[b"init-dh-ratchet-sk", &custody.main.chain_id],
+        );
         let init_dh_pub = PublicKey::from(&StaticSecret::from(init_dh_secret)).to_bytes();
-        let init_chain_key =
-            hmac_sha256_parts(shared_mesh_seed, &[b"init-dh-chain", &custody.main.chain_id]);
+        let init_chain_key = hmac_sha256_parts(
+            shared_mesh_seed,
+            &[b"init-dh-chain", &custody.main.chain_id],
+        );
 
         Ok(Self {
             config,
@@ -220,7 +228,8 @@ impl CellularMesh {
     ) -> Result<(Self, Self)> {
         let mut shared_mesh_seed = [0u8; 32];
         fill_random(&mut shared_mesh_seed)?;
-        let mut alice = Self::provision_device(config.clone(), custody.clone(), alice_hw, &shared_mesh_seed)?;
+        let mut alice =
+            Self::provision_device(config.clone(), custody.clone(), alice_hw, &shared_mesh_seed)?;
         let mut bob = Self::provision_device(config, custody, bob_hw, &shared_mesh_seed)?;
         shared_mesh_seed.zeroize();
 
@@ -367,7 +376,9 @@ impl CellularMesh {
             ));
         }
 
-        let mut root_cap = self.custody.derive_root_capability(self.config.fixed_step_budget);
+        let mut root_cap = self
+            .custody
+            .derive_root_capability(self.config.fixed_step_budget);
         let mut dh_out = match Self::dh_exchange(&self.ratchet.local_dh_secret, &packet.ratchet_pub)
         {
             Ok(s) => s,
@@ -489,11 +500,14 @@ impl CellularMesh {
         honey_profile: HoneyProfile,
     ) -> ReceiveOutcome {
         let observed_hw = hw.device_hw_id();
-        let mut authentic_mask =
-            u8::from(constant_time_eq(&self.clock_guard.device_hw_id, &observed_hw));
-        let (unseal_ok, mut unsealed) = match hw
-            .unseal_secret(LocalClientClockGuard::SEAL_LABEL, &self.clock_guard.sealed_hw_secret)
-        {
+        let mut authentic_mask = u8::from(constant_time_eq(
+            &self.clock_guard.device_hw_id,
+            &observed_hw,
+        ));
+        let (unseal_ok, mut unsealed) = match hw.unseal_secret(
+            LocalClientClockGuard::SEAL_LABEL,
+            &self.clock_guard.sealed_hw_secret,
+        ) {
             Ok(u) => (1u8, u),
             Err(_) => (0u8, [0u8; 32]),
         };
@@ -505,7 +519,10 @@ impl CellularMesh {
         authentic_mask &= tick_ok;
         let _exec_token = hmac_sha256_parts(
             &unsealed,
-            &[&self.clock_guard.device_hw_id, &candidate_tick.to_le_bytes()],
+            &[
+                &self.clock_guard.device_hw_id,
+                &candidate_tick.to_le_bytes(),
+            ],
         );
         unsealed.zeroize();
 
@@ -531,7 +548,9 @@ impl CellularMesh {
             .min(self.config.sub_matrix_bytes);
         norm_1000b[..s_copy].copy_from_slice(&packet.wire_cube.partial_1000b[..s_copy]);
 
-        let mut root_cap = self.custody.derive_root_capability(self.config.fixed_step_budget);
+        let mut root_cap = self
+            .custody
+            .derive_root_capability(self.config.fixed_step_budget);
         let (dh_ok, mut dh_out) =
             match Self::dh_exchange(&self.ratchet.local_dh_secret, &packet.ratchet_pub) {
                 Ok(s) => (1u8, s),
@@ -700,11 +719,15 @@ impl CellularMesh {
     }
 
     fn apply_epoch_hop_internal(&mut self) -> Result<u64> {
-        let mut root_cap = self.custody.derive_root_capability(self.config.fixed_step_budget);
+        let mut root_cap = self
+            .custody
+            .derive_root_capability(self.config.fixed_step_budget);
         let prev_epoch = self.epoch;
         let next_epoch = prev_epoch + 1;
-        let prev_epoch_key = Self::derive_epoch_key(&root_cap, &self.custody.main.chain_id, prev_epoch);
-        let next_epoch_key = Self::derive_epoch_key(&root_cap, &self.custody.main.chain_id, next_epoch);
+        let prev_epoch_key =
+            Self::derive_epoch_key(&root_cap, &self.custody.main.chain_id, prev_epoch);
+        let next_epoch_key =
+            Self::derive_epoch_key(&root_cap, &self.custody.main.chain_id, next_epoch);
         let spiral = SpiralSpace::new(self.config.space_dim, self.custody.auditor.spiral_coeffs);
 
         for (slot, coord) in self.coords.iter_mut().enumerate() {
@@ -731,9 +754,13 @@ impl CellularMesh {
     ) -> Result<crate::voxel::HealReport> {
         let _exec_token = self.clock_guard.authorize_local_execution(hw)?;
         if slot >= self.cubes.len() {
-            return Err(CubeHashError::InvalidConfig("cube slot index out of bounds"));
+            return Err(CubeHashError::InvalidConfig(
+                "cube slot index out of bounds",
+            ));
         }
-        let mut root_cap = self.custody.derive_root_capability(self.config.fixed_step_budget);
+        let mut root_cap = self
+            .custody
+            .derive_root_capability(self.config.fixed_step_budget);
         let epoch_key = Self::derive_epoch_key(&root_cap, &self.custody.main.chain_id, self.epoch);
         let res = self.cubes[slot].heal_at_epoch(&root_cap, Some((&epoch_key, self.epoch)));
         root_cap.zeroize();
@@ -746,8 +773,14 @@ impl CellularMesh {
     }
 
     /// Performs `O(W * K)` windowed spiral lookup for `target` coordinate (`Section 4.1`).
-    pub fn lookup_spiral_window(&self, start_slot: usize, target: Coord3D) -> (Option<usize>, usize) {
-        let mut root_cap = self.custody.derive_root_capability(self.config.fixed_step_budget);
+    pub fn lookup_spiral_window(
+        &self,
+        start_slot: usize,
+        target: Coord3D,
+    ) -> (Option<usize>, usize) {
+        let mut root_cap = self
+            .custody
+            .derive_root_capability(self.config.fixed_step_budget);
         let epoch_key = Self::derive_epoch_key(&root_cap, &self.custody.main.chain_id, self.epoch);
         let spiral = SpiralSpace::new(self.config.space_dim, self.custody.auditor.spiral_coeffs);
         let res = spiral.search_spiral_window(
@@ -857,7 +890,9 @@ impl CellularMesh {
         };
         eph_sk.zeroize();
 
-        let mut root_cap = self.custody.derive_root_capability(self.config.fixed_step_budget);
+        let mut root_cap = self
+            .custody
+            .derive_root_capability(self.config.fixed_step_budget);
         let mut ratcheted_root =
             Self::derive_ratcheted_root(&root_cap, &self.ratchet.chain_key, &dh_out);
         let algo = self.synthesize_ephemeral_algorithm(
@@ -875,7 +910,8 @@ impl CellularMesh {
             plain_core[0] = len_bytes[0];
             plain_core[1] = len_bytes[1];
             plain_core[2] = CORE_FLAG_RAW;
-            let tag = hmac_sha256_parts(&algo.algo_key, &[b"raw-core-tag", &next_seq.to_le_bytes()]);
+            let tag =
+                hmac_sha256_parts(&algo.algo_key, &[b"raw-core-tag", &next_seq.to_le_bytes()]);
             plain_core[3..8].copy_from_slice(&tag[..5]);
             plain_core[8..8 + payload.len()].copy_from_slice(payload);
             PayloadMode::RawCore256
@@ -931,7 +967,8 @@ impl CellularMesh {
             &payload_mode,
         );
 
-        let pending = self.build_transition(&root_cap, &algo, cube_fingerprint, next_seq, dh_out)?;
+        let pending =
+            self.build_transition(&root_cap, &algo, cube_fingerprint, next_seq, dh_out)?;
         self.pending_outbound = Some(pending);
         root_cap.zeroize();
         ratcheted_root.zeroize();
@@ -995,8 +1032,13 @@ impl CellularMesh {
                 let mut nonce = [0u8; 24];
                 let mut msg_key = [0u8; 32];
                 let kdf_ok = u8::from(
-                    hkdf_expand_label(algo_key, &plain_core[8..], b"cubehash-aead-nonce", &mut nonce)
-                        .is_ok()
+                    hkdf_expand_label(
+                        algo_key,
+                        &plain_core[8..],
+                        b"cubehash-aead-nonce",
+                        &mut nonce,
+                    )
+                    .is_ok()
                         && hkdf_expand_label(
                             algo_key,
                             fingerprint,
@@ -1042,7 +1084,12 @@ impl CellularMesh {
         whitened_stream(&sel_seed, b"quorum-perm", &mut stream);
         for i in (1..indices.len()).rev() {
             let off = i * 4;
-            let r = u32::from_le_bytes([stream[off], stream[off + 1], stream[off + 2], stream[off + 3]]);
+            let r = u32::from_le_bytes([
+                stream[off],
+                stream[off + 1],
+                stream[off + 2],
+                stream[off + 3],
+            ]);
             let j = (r as usize) % (i + 1);
             indices.swap(i, j);
         }
@@ -1130,7 +1177,11 @@ impl CellularMesh {
 
         let next_main_root = hmac_sha256_parts(
             &algo.algo_key,
-            &[b"next-main-root", &self.custody.main.active_chain_state, &next_seed],
+            &[
+                b"next-main-root",
+                &self.custody.main.active_chain_state,
+                &next_seed,
+            ],
         );
         let ack_mac_key = hmac_sha256_parts(&algo.algo_key, &[b"delivery-ack-key-v2"]);
         next_seed.zeroize();
@@ -1215,7 +1266,12 @@ impl CellularMesh {
     ) -> [u8; 32] {
         hmac_sha256_parts(
             ack_mac_key,
-            &[b"delivery-ack-v2", fingerprint, &seq.to_le_bytes(), next_ratchet_pub],
+            &[
+                b"delivery-ack-v2",
+                fingerprint,
+                &seq.to_le_bytes(),
+                next_ratchet_pub,
+            ],
         )
     }
 
@@ -1300,7 +1356,8 @@ impl DuplexCubeSession {
     ) -> Result<(Self, Self)> {
         let (a_tx, b_rx) =
             CellularMesh::new_paired(config.clone(), alice_to_bob_custody, alice_hw, bob_hw)?;
-        let (b_tx, a_rx) = CellularMesh::new_paired(config, bob_to_alice_custody, bob_hw, alice_hw)?;
+        let (b_tx, a_rx) =
+            CellularMesh::new_paired(config, bob_to_alice_custody, bob_hw, alice_hw)?;
         Ok((Self { tx: a_tx, rx: a_rx }, Self { tx: b_tx, rx: b_rx }))
     }
 
@@ -1363,7 +1420,8 @@ impl DuplexCubeSession {
         target_epoch: u64,
         epoch_eph_pub: [u8; 32],
     ) -> Result<u64> {
-        self.rx.hop_epoch_ratchet_rx(hw, target_epoch, epoch_eph_pub)
+        self.rx
+            .hop_epoch_ratchet_rx(hw, target_epoch, epoch_eph_pub)
     }
 }
 

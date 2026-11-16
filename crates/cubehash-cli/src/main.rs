@@ -56,8 +56,7 @@ fn audit_entropy_and_lifecycle() {
     .unwrap();
     let alice_hw = VirtualHardwareEnclave::random().unwrap();
     let bob_hw = VirtualHardwareEnclave::random().unwrap();
-    let (mut alice, mut bob) =
-        CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
+    let (mut alice, mut bob) = CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
 
     let stats = alice.audit_stats();
     println!(
@@ -99,8 +98,7 @@ fn audit_tmr_self_healing() {
     .unwrap();
     let alice_hw = VirtualHardwareEnclave::random().unwrap();
     let bob_hw = VirtualHardwareEnclave::random().unwrap();
-    let (mut alice, mut bob) =
-        CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
+    let (mut alice, mut bob) = CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
 
     let mut pkt = alice
         .begin_send_raw_core(&alice_hw, b"TMR-CRITICAL-20BYTES")
@@ -132,8 +130,7 @@ fn audit_cloning_and_recovery() {
     let eve_hw = VirtualHardwareEnclave::random().unwrap();
     let new_hw = VirtualHardwareEnclave::random().unwrap();
 
-    let (mut alice, mut bob) =
-        CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
+    let (mut alice, mut bob) = CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
 
     let clone_err = alice.begin_send_message(&eve_hw, b"steal").unwrap_err();
     assert_eq!(clone_err, CubeHashError::UnauthorizedHardware);
@@ -160,8 +157,7 @@ fn audit_zero_oracle_honey() {
     let alice_hw = VirtualHardwareEnclave::random().unwrap();
     let bob_hw = VirtualHardwareEnclave::random().unwrap();
     let attacker_hw = VirtualHardwareEnclave::random().unwrap();
-    let (mut alice, mut bob) =
-        CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
+    let (mut alice, mut bob) = CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
 
     let pkt = alice.begin_send_message(&alice_hw, b"real secret").unwrap();
     let decoy = bob.decrypt_zero_oracle(&attacker_hw, &pkt, HoneyProfile::Bip39ChecksumPhrase);
@@ -197,8 +193,7 @@ fn audit_ack_rollback_and_epochs() {
     .unwrap();
     let alice_hw = VirtualHardwareEnclave::random().unwrap();
     let bob_hw = VirtualHardwareEnclave::random().unwrap();
-    let (mut alice, mut bob) =
-        CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
+    let (mut alice, mut bob) = CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
 
     let _lost = alice.begin_send_message(&alice_hw, b"dropped").unwrap();
     alice.rollback_outbound().unwrap();
@@ -231,7 +226,11 @@ fn audit_fixed_budget_and_throughput() {
             let _ = std::hint::black_box(fixed_budget_mix(algo, &key, b"bench", &data, 4));
         }
         let elapsed_us = t0.elapsed().as_micros() as f64 / 500.0;
-        println!("  - {:<14} avg={:.2} us/op", format!("{algo:?}"), elapsed_us);
+        println!(
+            "  - {:<14} avg={:.2} us/op",
+            format!("{algo:?}"),
+            elapsed_us
+        );
     }
 
     let cfg = MeshConfig::standard();
@@ -244,8 +243,7 @@ fn audit_fixed_budget_and_throughput() {
     .unwrap();
     let alice_hw = VirtualHardwareEnclave::random().unwrap();
     let bob_hw = VirtualHardwareEnclave::random().unwrap();
-    let (mut alice, mut bob) =
-        CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
+    let (mut alice, mut bob) = CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
 
     let msg = vec![0x55u8; 512];
     let t0 = Instant::now();

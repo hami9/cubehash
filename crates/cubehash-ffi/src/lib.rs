@@ -160,7 +160,12 @@ pub unsafe extern "C" fn cubehash_provision_device(
     out_session: *mut *mut CubeSessionHandle,
 ) -> i32 {
     ffi_guard(|| {
-        if cfg.is_null() || shared_seed_32.is_null() || hw_id_16.is_null() || hw_key_32.is_null() || out_session.is_null() {
+        if cfg.is_null()
+            || shared_seed_32.is_null()
+            || hw_id_16.is_null()
+            || hw_key_32.is_null()
+            || out_session.is_null()
+        {
             return CUBEHASH_ERR_NULL_PTR;
         }
         let config = (&*cfg).0.clone();
@@ -177,7 +182,8 @@ pub unsafe extern "C" fn cubehash_provision_device(
             .unwrap();
         let root_pattern = hmac_sha256_parts(seed_slice, &[b"ffi-root-pattern"]);
         let auditor_secret = hmac_sha256_parts(seed_slice, &[b"ffi-auditor-secret"]);
-        let synthesis_salt: [u8; 16] = hmac_sha256_parts(seed_slice, &[b"ffi-synthesis-salt"])[..16]
+        let synthesis_salt: [u8; 16] = hmac_sha256_parts(seed_slice, &[b"ffi-synthesis-salt"])
+            [..16]
             .try_into()
             .unwrap();
         let mesh_seed = hmac_sha256_parts(seed_slice, &[b"ffi-mesh-seed"]);
@@ -312,7 +318,11 @@ pub unsafe extern "C" fn cubehash_receive_zero_oracle(
     out_outcome_tag: *mut i32,
 ) -> i32 {
     ffi_guard(|| {
-        if session.is_null() || out_data.is_null() || out_ack_json.is_null() || out_outcome_tag.is_null() {
+        if session.is_null()
+            || out_data.is_null()
+            || out_ack_json.is_null()
+            || out_outcome_tag.is_null()
+        {
             return CUBEHASH_ERR_NULL_PTR;
         }
         let pkt_bytes = match slice_from_raw(packet_json, packet_len) {
@@ -354,7 +364,9 @@ pub unsafe extern "C" fn cubehash_receive_zero_oracle(
                 *out_outcome_tag = CUBEHASH_OUTCOME_AUTHENTIC;
                 CUBEHASH_OK
             }
-            ReceiveOutcome::HoneyDeception { plausible_output, .. } => {
+            ReceiveOutcome::HoneyDeception {
+                plausible_output, ..
+            } => {
                 *out_data = CubeBuffer::from_vec(plausible_output);
                 *out_ack_json = CubeBuffer::empty();
                 *out_outcome_tag = CUBEHASH_OUTCOME_HONEY;

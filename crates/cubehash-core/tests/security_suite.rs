@@ -95,8 +95,8 @@ fn test_dual_mode_raw_core_and_arbitrary_payload() {
     ));
 
     // 2. ArbitraryPayload mode: UTF-8 + multi-KB messages
-    let long_chat = "سلام! این یک پیام تستی رمزنگاری‌شده با شبکه سلولی ۱۰۰ کیوبی CubeHash است. 🚀 "
-        .repeat(35);
+    let long_chat =
+        "سلام! این یک پیام تستی رمزنگاری‌شده با شبکه سلولی ۱۰۰ کیوبی CubeHash است. 🚀 ".repeat(35);
     let mut chat_pkt = alice
         .begin_send_message(&alice_hw, long_chat.as_bytes())
         .unwrap();
@@ -151,7 +151,9 @@ fn test_100_cube_cellular_lifecycle_entropy_and_ram() {
     assert!(alice.cubes().iter().all(|c| c.generation >= 21));
 
     // Verify wire cube statistical 50/50 bit distribution across payload + padding
-    let pkt = alice.begin_send_raw_core(&alice_hw, b"probe-stats").unwrap();
+    let pkt = alice
+        .begin_send_raw_core(&alice_hw, b"probe-stats")
+        .unwrap();
     let mut wire_bytes = Vec::new();
     wire_bytes.extend_from_slice(&pkt.wire_cube.partial_256b);
     wire_bytes.extend_from_slice(&pkt.wire_cube.partial_1000b);
@@ -169,14 +171,15 @@ fn test_ack_commit_and_network_drop_rollback() {
     let custody = make_custody(&cfg);
     let alice_hw = VirtualHardwareEnclave::random().unwrap();
     let bob_hw = VirtualHardwareEnclave::random().unwrap();
-    let (mut alice, mut bob) =
-        CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
+    let (mut alice, mut bob) = CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
 
     let snapshot_seq = alice.sequence();
     let snapshot_gen0 = alice.cubes()[0].generation;
 
     // Begin send -> arrival-triggered means Alice does NOT commit yet
-    let _dropped_pkt = alice.begin_send_message(&alice_hw, b"lost in transit").unwrap();
+    let _dropped_pkt = alice
+        .begin_send_message(&alice_hw, b"lost in transit")
+        .unwrap();
     assert!(alice.has_pending_outbound());
     assert_eq!(alice.sequence(), snapshot_seq);
     assert_eq!(alice.cubes()[0].generation, snapshot_gen0);
@@ -193,7 +196,9 @@ fn test_ack_commit_and_network_drop_rollback() {
     assert_eq!(alice.sequence(), 0);
 
     // Subsequent message transmits and commits cleanly
-    let mut pkt = alice.begin_send_message(&alice_hw, b"after rollback").unwrap();
+    let mut pkt = alice
+        .begin_send_message(&alice_hw, b"after rollback")
+        .unwrap();
     let (pt, mut ack, _) = bob.receive_authenticated(&bob_hw, &mut pkt).unwrap();
     assert_eq!(pt, b"after rollback");
 
@@ -218,8 +223,7 @@ fn test_bitwise_majority_voting_self_healing_wire_and_storage() {
     let custody = make_custody(&cfg);
     let alice_hw = VirtualHardwareEnclave::random().unwrap();
     let bob_hw = VirtualHardwareEnclave::random().unwrap();
-    let (mut alice, mut bob) =
-        CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
+    let (mut alice, mut bob) = CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
 
     let mut pkt = alice
         .begin_send_message(&alice_hw, b"noisy wireless transmission!")
@@ -248,7 +252,9 @@ fn test_bitwise_majority_voting_self_healing_wire_and_storage() {
     assert!(!report.unrecoverable_anomaly);
 
     // Severe corruption flipping all 3 copies in same positions + hot-spare must be rejected
-    let mut ruined_pkt = alice.begin_send_message(&alice_hw, b"catastrophic").unwrap();
+    let mut ruined_pkt = alice
+        .begin_send_message(&alice_hw, b"catastrophic")
+        .unwrap();
     for i in 0..32 {
         ruined_pkt.wire_cube.partial_256b[i] ^= 0xFF;
         ruined_pkt.wire_cube.partial_1000b[i] ^= 0xFF;
@@ -315,8 +321,7 @@ fn test_replay_and_monotonic_clock_protection() {
     let custody = make_custody(&cfg);
     let alice_hw = VirtualHardwareEnclave::random().unwrap();
     let bob_hw = VirtualHardwareEnclave::random().unwrap();
-    let (mut alice, mut bob) =
-        CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
+    let (mut alice, mut bob) = CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
 
     let mut pkt = alice.begin_send_message(&alice_hw, b"nonce-once").unwrap();
     let pkt_replay = pkt.clone();
@@ -416,17 +421,19 @@ fn test_zero_oracle_honey_encryption_and_anti_desync() {
     let alice_hw = VirtualHardwareEnclave::random().unwrap();
     let bob_hw = VirtualHardwareEnclave::random().unwrap();
     let attacker_hw = VirtualHardwareEnclave::random().unwrap();
-    let (mut alice, mut bob) =
-        CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
+    let (mut alice, mut bob) = CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
 
     let pkt = alice
         .begin_send_message(&alice_hw, b"top secret wallet mnemonic")
         .unwrap();
 
     // 1. Unauthorized hardware probe -> Honey BIP-39 phrase with valid SHA-256 checksum!
-    let outcome_bip39 = bob.decrypt_zero_oracle(&attacker_hw, &pkt, HoneyProfile::Bip39ChecksumPhrase);
+    let outcome_bip39 =
+        bob.decrypt_zero_oracle(&attacker_hw, &pkt, HoneyProfile::Bip39ChecksumPhrase);
     match outcome_bip39 {
-        ReceiveOutcome::HoneyDeception { plausible_output, .. } => {
+        ReceiveOutcome::HoneyDeception {
+            plausible_output, ..
+        } => {
             let phrase = String::from_utf8(plausible_output).expect("valid utf8 mnemonic");
             assert_eq!(phrase.split_whitespace().count(), 12);
             assert!(DteEngine::verify_bip39_like_checksum(&phrase));
@@ -439,7 +446,9 @@ fn test_zero_oracle_honey_encryption_and_anti_desync() {
     tampered.packet_mac[0] ^= 0x01;
     let outcome_chat = bob.decrypt_zero_oracle(&bob_hw, &tampered, HoneyProfile::ChatPlaintext);
     match outcome_chat {
-        ReceiveOutcome::HoneyDeception { plausible_output, .. } => {
+        ReceiveOutcome::HoneyDeception {
+            plausible_output, ..
+        } => {
             let text = String::from_utf8(plausible_output).expect("valid utf8 chat");
             assert!(!text.is_empty());
         }
@@ -492,8 +501,7 @@ fn test_wire_serialization_and_subcube_layout() {
     let custody = make_custody(&cfg);
     let alice_hw = VirtualHardwareEnclave::random().unwrap();
     let bob_hw = VirtualHardwareEnclave::random().unwrap();
-    let (mut alice, mut bob) =
-        CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
+    let (mut alice, mut bob) = CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
 
     // Verify Section 7 SubCube TryFrom layout matches standard 32B / 125B cube
     let sub_cube = cubehash_core::SubCube::try_from(&alice.cubes()[0]).unwrap();
@@ -552,7 +560,8 @@ fn test_os_hardware_provider_and_all_time_algorithms() {
             cfg.consume_for_next,
         )
         .unwrap();
-        let alice_hw = OsBoundHardwareProvider::from_host_and_secret(&[0x33 + idx as u8; 32], b"alice");
+        let alice_hw =
+            OsBoundHardwareProvider::from_host_and_secret(&[0x33 + idx as u8; 32], b"alice");
         let bob_hw = OsBoundHardwareProvider::from_host_and_secret(&[0x77 + idx as u8; 32], b"bob");
         let (mut alice, mut bob) =
             CellularMesh::new_paired(cfg.clone(), custody, &alice_hw, &bob_hw).unwrap();
@@ -572,8 +581,7 @@ fn test_dh_ratchet_forward_post_compromise_and_tamper_resistance() {
     let custody = make_custody(&cfg);
     let alice_hw = VirtualHardwareEnclave::random().unwrap();
     let bob_hw = VirtualHardwareEnclave::random().unwrap();
-    let (mut alice, mut bob) =
-        CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
+    let (mut alice, mut bob) = CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
 
     // Independent X25519 keys on Alice and Bob from genesis
     assert_ne!(alice.local_dh_pub(), bob.local_dh_pub());
@@ -626,11 +634,14 @@ fn test_dh_ratchet_forward_post_compromise_and_tamper_resistance() {
     let (new_ep, epoch_pub) = alice.hop_epoch_ratchet_tx(&alice_hw).unwrap();
     assert_eq!(new_ep, 1);
     assert_eq!(
-        bob.hop_epoch_ratchet_rx(&bob_hw, new_ep, epoch_pub).unwrap(),
+        bob.hop_epoch_ratchet_rx(&bob_hw, new_ep, epoch_pub)
+            .unwrap(),
         1
     );
 
-    let mut pkt3 = alice.begin_send_message(&alice_hw, b"post-dh-epoch").unwrap();
+    let mut pkt3 = alice
+        .begin_send_message(&alice_hw, b"post-dh-epoch")
+        .unwrap();
     let (pt3, ack3, _) = bob.receive_authenticated(&bob_hw, &mut pkt3).unwrap();
     assert_eq!(pt3, b"post-dh-epoch");
     alice.commit_ack(&alice_hw, &ack3).unwrap();
@@ -643,10 +654,11 @@ fn test_zero_oracle_constant_work_never_mutates_on_any_failure() {
     let alice_hw = VirtualHardwareEnclave::random().unwrap();
     let bob_hw = VirtualHardwareEnclave::random().unwrap();
     let attacker_hw = VirtualHardwareEnclave::random().unwrap();
-    let (mut alice, mut bob) =
-        CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
+    let (mut alice, mut bob) = CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
 
-    let pkt = alice.begin_send_message(&alice_hw, b"sensitive-payload").unwrap();
+    let pkt = alice
+        .begin_send_message(&alice_hw, b"sensitive-payload")
+        .unwrap();
     let tick_before = bob.clock_guard_mut().local_monotonic_tick;
     let dh_before = bob.local_dh_pub();
 

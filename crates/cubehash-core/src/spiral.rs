@@ -48,12 +48,7 @@ impl SpiralSpace {
     }
 
     /// Applies a provably invertible 1-to-1 (bijective) keyed permutation across `[0, space_dim)^3`.
-    pub fn hop_coord_bijective(
-        &self,
-        epoch_key: &[u8; 32],
-        epoch: u64,
-        coord: Coord3D,
-    ) -> Coord3D {
+    pub fn hop_coord_bijective(&self, epoch_key: &[u8; 32], epoch: u64, coord: Coord3D) -> Coord3D {
         let d = self.space_dim as i64;
         let params = self.derive_bijection_params(epoch_key, epoch);
 
@@ -87,8 +82,8 @@ impl SpiralSpace {
         // Inverse Layer 2 in reverse order.
         let z1 = ((hopped.z as i64 - mix_pair(&params.mix_key, 3, hopped.x, hopped.y, d))
             .rem_euclid(d)) as u32;
-        let y1 = ((hopped.y as i64 - mix_pair(&params.mix_key, 2, hopped.x, z1, d))
-            .rem_euclid(d)) as u32;
+        let y1 = ((hopped.y as i64 - mix_pair(&params.mix_key, 2, hopped.x, z1, d)).rem_euclid(d))
+            as u32;
         let x1 = ((hopped.x as i64 - mix_pair(&params.mix_key, 1, y1, z1, d)).rem_euclid(d)) as u32;
 
         // Inverse Layer 1 using modular multiplicative inverses.
@@ -109,7 +104,12 @@ impl SpiralSpace {
         whitened_stream(epoch_key, &epoch.to_le_bytes(), &mut stream);
         for i in (1..n_nibbles).rev() {
             let off = i * 4;
-            let raw = u32::from_le_bytes([stream[off], stream[off + 1], stream[off + 2], stream[off + 3]]);
+            let raw = u32::from_le_bytes([
+                stream[off],
+                stream[off + 1],
+                stream[off + 2],
+                stream[off + 3],
+            ]);
             let j = (raw as usize) % (i + 1);
             perm.swap(i, j);
         }

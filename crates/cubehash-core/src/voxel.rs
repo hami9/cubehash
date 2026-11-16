@@ -50,7 +50,9 @@ mod serde_bytes_125 {
         s.serialize_bytes(val)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<[u8; 125], D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> std::result::Result<[u8; 125], D::Error> {
         let bytes: Vec<u8> = serde::Deserialize::deserialize(d)?;
         bytes
             .try_into()
@@ -117,7 +119,8 @@ impl VoxelCube {
         seed_material: &[u8; 32],
     ) -> Result<Self> {
         let mut cube_uid = [0u8; 16];
-        let uid_digest = hmac_sha256_parts(seed_material, &[b"cube-uid", &generation.to_le_bytes()]);
+        let uid_digest =
+            hmac_sha256_parts(seed_material, &[b"cube-uid", &generation.to_le_bytes()]);
         cube_uid.copy_from_slice(&uid_digest[..16]);
 
         let mut core_pattern = vec![0u8; config.core_bytes];
@@ -229,8 +232,7 @@ pub(crate) fn encode_sub_matrix_with_shadows(
     core_pattern: &[u8],
 ) -> Vec<u8> {
     let core_len = core_pattern.len();
-    let (mask_a, mask_b, spare_key) =
-        derive_shadow_masks(seal_key, cube_uid, generation, core_len);
+    let (mask_a, mask_b, spare_key) = derive_shadow_masks(seal_key, cube_uid, generation, core_len);
     let mut sub = vec![0u8; config.sub_matrix_bytes];
 
     for i in 0..core_len {
