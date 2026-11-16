@@ -1,35 +1,176 @@
-# CubeHash Security Engine & Zero-Knowledge Chat
+# CubeHash — Cellular 3-Cube Cryptography Engine
 
-Decoupled Rust workspace implementing the CubeHash 3-cube algebraic/AEAD security engine (`cubehash-core`), C ABI bindings (`cubehash-ffi`), benchmark/audit runner (`cubehash-cli`), and a headless TLS blind-relay encrypted chat (`cubehash-chat`).
+**CubeHash** is a standalone, general-purpose cryptographic engine implemented in pure Rust (`#![forbid(unsafe_code)]` in the core crate) with a C/C++ ABI (`cubehash-ffi`) and a built-in adversarial audit & benchmark CLI (`cubehash-cli`).
 
-## Workspace Crates
+> This repository contains **strictly the CubeHash algorithm, FFI bindings, and its verification/audit suite** — no chat server, UI, or transport application code.
 
-- **`crates/cubehash-core`** (`#![forbid(unsafe_code)]`): General-purpose security engine featuring `MotherCube` / `MainCube` / `AuditorCube` 3-cube custody, hardware-bound key derivation (`OsBoundHardwareProvider`), X25519 DH Ratchet (`WirePacket.ratchet_pub` & `DeliveryAck.next_ratchet_pub`), Triple Modular Redundancy (TMR) bit-rot healing, constant-work `decrypt_zero_oracle` honey deception, synchronized epoch hopping, and losslessly rolled-back TX/RX state transitions.
-- **`crates/cubehash-ffi`**: C ABI (`cdylib` / `staticlib`) exposing the core security engine for external applications.
-- **`crates/cubehash-cli`**: Security audit and performance benchmark CLI.
-- **`crates/cubehash-chat`**: Headless WebSocket-over-TLS (`wss://`) blind relay server and CLI chat client with:
-  - TLS 1.2/1.3 transport via `rustls` (`ring` provider) + certificate SHA-256 pinning / custom CA / WebPKI (`--insecure-ws` required to opt into plaintext `ws://`).
-  - Ed25519 challenge-response relay authentication, sender ownership checks, identity pinning, and signed `PairOffer` / `PairAccept` / `EpochHopNotice` frames.
-  - OS-sealed keystore (`DeviceIdentity`: Windows DPAPI + Registry `MachineGuid` + TPM 2.0 CNG probe + optional `--hw-secret` 2FA entropy).
-  - X25519 pairing + explicit `/accept` confirmation (or `/psk` auto-accept) + 256-byte bucketed chat payload padding.
+---
 
-## Quick Commands
+## Table of Contents
 
-Run all tests and lint checks:
+1. [Core Idea & Motivation](#1-core-idea--motivation)
+2. [What Is Inside This Repository](#2-what-is-inside-this-repository)
+3. [How CubeHash Works](#3-how-cubehash-works)
+4. [Mathematical Foundations](#4-mathematical-foundations)
+5. [Security Tests & Live Audit Benchmarks](#5-security-tests--live-audit-benchmarks)
+6. [Quick Commands](#6-quick-commands)
+
+Further deep dives:
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — Module anatomy, state machine, rollback atomicity, and C ABI surface
+- [docs/MATHEMATICS.md](docs/MATHEMATICS.md) — Formal mathematical specification, proofs of invertibility, and exact key schedule
+- [docs/VERIFICATION.md](docs/VERIFICATION.md) — Complete test matrix (`15` integration tests) and verified release benchmark output
+
+---
+
+## 1. Core Idea & Motivation
+
+Conventional authenticated channels derive session keys from a single static secret or linear key schedule. If memory is snapshotted, bit-rot flips wire bits before verification, device state is cloned onto another host, or a decryption failure leaks a distinct error oracle, attackers gain structural leverage.
+
+**CubeHash** combines five defensive paradigms into a cohesive, lightweight state machine (`~17.7 KB` RAM in standard 100-cube configuration):
+
+1. **Volumetric Cellular Turnover (`25` Select / `20` Consume / `1` Kill + `1` Birth):**
+   Instead of one key, both peers maintain a synchronized **mesh of 100 3D `VoxelCube`s** embedded inside a $1000 \times 1000 \times 1000$ keyed 3D coordinate space. Every committed message deterministically selects a **25-cube quorum**, mixes **20** of them non-linearly to birth **1 next-generation cube**, and retires the **oldest-generation cube** (`110` messages completely rotate every original genesis cube).
+2. **Tripartite 3-Cube Hardware Custody (`MotherCube` + `MainCube` + `AuditorCube`):**
+   Session root capability requires *all three* custody cubes simultaneously; any 2-of-3 subset cannot reconstruct it. Execution is further locked to a local `HardwareProvider` enclave + strictly monotonic counter (`LocalClientClockGuard`), blocking offline state cloning and replay attacks without external NTP servers. Possession of all three cubes allows clean recovery onto replacement hardware (`recover_onto_new_hardware`).
+3. **Per-Message X25519 Double Ratchet:**
+   Every outbound wire packet carries a fresh OS CSPRNG ephemeral `X25519` public key (`ratchet_pub`) and every verified `DeliveryAck` rotates the receiver's `X25519` identity (`next_ratchet_pub`), providing **Forward Secrecy** and **Post-Compromise Security (PCS)** layered underneath the cellular cube synthesis.
+4. **In-Band TMR Bit-Rot Self-Healing Before MAC:**
+   Each standard `VoxelCube` embeds two independently HMAC-masked **Triple Modular Redundancy (TMR)** shadow copies plus an **8-byte hot-spare MAC** inside its `1000-bit` (`125 B`) sub-matrix. Up to `1` flipped copy at any bit position is transparently repaired by **Bitwise Majority Voting** *before* MAC verification, recovering cleanly over noisy channels or bit-rotted storage.
+5. **Zero-Oracle Honey Deception & Constant-Work Timing Hardening:**
+   When using `decrypt_zero_oracle`, the receiver executes the full hardware check, TMR repair, MAC check, transition build, **and** Distribution-Transforming Encoder (DTE) decoy synthesis **uniformly without early returns or state mutation on failure**. Any forged packet, stale replay, tampered ratchet key, or cloned-device probe emits a plausible format-valid output (e.g., a 12-word BIP-39-like phrase with a real SHA-256 checksum word, or natural UTF-8 chat text) while mutating **zero** state — preventing oracle leaks and peer desync.
+
+---
+
+## 2. What Is Inside This Repository
+
+```text
+CubeHash/
+├── crates/
+│   ├── cubehash-core/      # Pure Rust algorithm engine (#![forbid(unsafe_code)])
+│   │   ├── src/
+│   │   │   ├── config.rs       # Resizable MeshConfig profiles (compact / standard / high_capacity)
+│   │   │   ├── custody.rs      # MotherCube, MainCube, AuditorCube, ThreeCubeCustody, HardwareProvider, LocalClientClockGuard
+│   │   │   ├── primitives.rs   # fixed_budget_mix (BLAKE2b/SHA3-256/HMAC-SHA256/HybridTriMix), XChaCha20-Poly1305, HKDF-SHA256, non-linear combiners
+│   │   │   ├── voxel.rs        # VoxelCube (3 layers), SubCube (181B), encode_sub_matrix_with_shadows, TMR heal_bitwise / heal_at_epoch
+│   │   │   ├── spiral.rs       # 3D SpiralSpace, coprime-affine + triangular Feistel bijection, 250-nibble bijection, O(W*K) search
+│   │   │   ├── honey.rs        # Decoy chain synthesis & DteEngine (Bip39ChecksumPhrase / ChatPlaintext / RawUniform)
+│   │   │   ├── mesh.rs         # CellularMesh, DuplexCubeSession, EphemeralCubeAlgorithm, WirePacket, DeliveryAck, rollback
+│   │   │   └── error.rs        # Typed CubeHashError variants
+│   │   └── tests/
+│   │       └── security_suite.rs   # 14 comprehensive adversarial & property tests
+│   ├── cubehash-ffi/       # C ABI bindings (cdylib + staticlib) & include/cubehash.h
+│   │   └── tests/
+│   │       └── ffi_smoke.rs        # C ABI full-lifecycle, zero-oracle, & memory safety smoke test
+│   └── cubehash-cli/       # Standalone 7-stage security audit & throughput benchmark binary
+└── docs/
+    ├── ARCHITECTURE.md     # Detailed system design, C ABI, rollback & epoch flow
+    ├── MATHEMATICS.md      # Complete formal equations & bijectivity proofs
+    └── VERIFICATION.md     # Full test matrix & observed benchmark output
+```
+
+### Resizable `MeshConfig` Profiles
+
+| Profile | Mesh Size ($N$) | Quorum ($Q / C$) | Core Layer | Sub-Matrix Layer | Base Wire Cube | Weight Padding | Coordinate Space |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `compact` | `40` cubes | `12` select / `9` consume | `16 B` (128 bits) | `64 B` (512 bits) | `96 B` | `8..=32 B` | $256^3$ |
+| `standard` (default) | `100` cubes | `25` select / `20` consume | `32 B` (256 bits) | `125 B` (1000 bits) | `173 B` | `16..=96 B` | $1000^3$ |
+| `high_capacity` | `160` cubes | `40` select / `32` consume | `64 B` (512 bits) | `256 B` (2048 bits) | `336 B` | `32..=160 B` | $2000^3$ |
+
+---
+
+## 3. How CubeHash Works
+
+### 3.1 Three-Layer `VoxelCube` & Wire Representation
+
+```mermaid
+flowchart LR
+    subgraph VC["VoxelCube in Mesh (~181 B base)"]
+        UID["cube_uid (16 B) + generation (8 B)"]
+        CORE["core_pattern (32 B / 256 bits)<br/>Flags + Tag/Nonce Seed + RawCore Payload"]
+        SUB["sub_matrix (125 B / 1000 bits / 250 nibbles)<br/>Shadow A (32 B) + Shadow B (32 B) + HotSpare MAC (8 B) + Filler (53 B)"]
+        WT["weight_layer (16..96 B)<br/>CSPRNG 50/50 Traffic-Analysis Padding"]
+    end
+```
+
+### 3.2 Arrival-Triggered Transaction, Atomic Rollback & Epoch Hopping
+
+```mermaid
+sequenceDiagram
+    participant Alice as Alice (TX CellularMesh + HW)
+    participant Wire as Network / Storage
+    participant Bob as Bob (RX CellularMesh + HW)
+
+    Note over Alice: Custody Root + X25519 DH + 25-of-100 Quorum -> algo_key
+    Alice->>Alice: begin_send_*: stage PendingTransition (DO NOT mutate mesh yet)
+    Alice->>Wire: WirePacket { WireCube(173B + pad), seq, epoch, ratchet_pub, PayloadMode, packet_mac }
+    Note over Wire: Noise / Bit-Rot or Attacker Tampering
+    Wire->>Bob: Deliver WirePacket
+    Bob->>Bob: 1. HardwareProvider lock + sequence/epoch check<br/>2. TMR Majority Voting heals partial_256b & shadows<br/>3. Verify packet_mac + decrypt (or DTE Honey Deception)<br/>4. Rotate Bob X25519 keypair + commit 25/20/kill/birth
+    Bob->>Wire: DeliveryAck { fingerprint, seq, next_ratchet_pub, ack_mac }
+    alt Authentic DeliveryAck Received
+        Wire->>Alice: Deliver DeliveryAck
+        Alice->>Alice: commit_ack: verify ack_mac & advance ratchet + mesh
+    else Network Drop / Timeout
+        Alice->>Alice: rollback_outbound: discard PendingTransition cleanly (zero desync)
+    end
+```
+
+### 3.3 Bijective Epoch Hopping
+
+On `hop_epoch` (or `hop_epoch_ratchet_tx` / `hop_epoch_ratchet_rx`), every real and decoy cube undergoes two simultaneous invertible (1-to-1) mappings keyed by `epoch_key`:
+1. **3D Coordinate Bijection:** Every cube coordinate in $[0, D)^3$ moves via a modular coprime-affine transform composed with triangular Feistel cross-axis mixing (`SpiralSpace::hop_coord_bijective`).
+2. **250-Nibble Bijection:** Every 4-bit nibble of `sub_matrix` (`125 B = 250 nibbles`) is shuffled via a keyed Fisher–Yates permutation (`SpiralSpace::permute_nibbles`). When TMR self-healing runs on a stored cube at `epoch > 0`, the sub-matrix is inverted cleanly with `unpermute_nibbles`, repaired via Majority Voting, and re-permuted back into `epoch`.
+
+---
+
+## 4. Mathematical Foundations
+
+> Full proofs, key schedules, and equations are in **[docs/MATHEMATICS.md](docs/MATHEMATICS.md)**.
+
+- **3-Cube Capability Synthesis:**
+  $$K_{\text{root}} = \text{FixedBudgetMix}\Big(\text{Algo},\; \text{HMAC}(K_{\text{mother}}, \text{"3cube-root"} \| S_{\text{owner}} \| \text{chain\_id}),\; P_{\text{main}} \| S_{\text{synth}} \| K_{\text{auditor}}\Big)$$
+- **Ratcheted Ephemeral Key Derivation:**
+  $$K_{\text{ratchet}} = \text{HMAC}(K_{\text{root}}, \text{"dh-ratchet-root-v1"} \| K_{\text{chain}} \| \text{X25519}(sk, pk_{\text{peer}}))$$
+- **Bitwise Majority Voting (TMR):** For primary byte $C_i$ and unmasked shadow copies $A_i = S_i \oplus M_{A,i}$, $B_i = S_{L+i} \oplus M_{B,i}$:
+  $$V_i = (C_i \land A_i) \lor (C_i \land B_i) \lor (A_i \land B_i)$$
+  followed by hot-spare integrity verification checking Hamming distance $d_H(T_{\text{obs}}, \text{MAC}_{\text{spare}}) \le 2$ bits.
+- **Bijective 3D Spiral Space Transform on $(\mathbb{Z}_D)^3$:**
+  - *Layer 1 (Coprime Affine, $\gcd(a_k, D) = 1$):* $(x_1, y_1, z_1) = (a_x x + b_x,\; a_y y + b_y,\; a_z z + b_z) \bmod D$
+  - *Layer 2 (Triangular Feistel):*
+    $$x_2 \equiv x_1 + F_1(y_1, z_1) \pmod D,\quad y_2 \equiv y_1 + F_2(x_2, z_1) \pmod D,\quad z_2 \equiv z_1 + F_3(x_2, y_2) \pmod D$$
+- **Constant-Work Tri-Hash Core:** `fixed_budget_mix` executes *all three* primitives (`BLAKE2b`, `SHA3-256`, `HMAC-SHA256`) for `fixed_step_budget` iterations, forms $\text{HybridTriMix}_i = b_i \oplus (s_i \lll 3) \oplus (h_i \ggg 5)$, and selects the configured target branchlessly via `subtle::ConditionallySelectable`.
+
+---
+
+## 5. Security Tests & Live Audit Benchmarks
+
+Verified across **`cubehash-core` (`14/14` security tests)**, **`cubehash-ffi` (`1/1` C-ABI test)**, and **`cubehash-cli` (`7` audit & benchmark stages)** — see [docs/VERIFICATION.md](docs/VERIFICATION.md) for every test and measurement:
+
+- **Zero compiler/lint warnings:** `cargo clippy --workspace --all-targets -- -D warnings`
+- **All tests passing (`15/15`):**
+  - Resizable profile validation (`compact`, `standard`, `high_capacity`)
+  - Dual payload mode (`RawCore256` <= `24 B` + `ArbitraryCiphertext` `XChaCha20-Poly1305`)
+  - `120`-message cellular lifecycle rotation (`~18,100 B` RAM, `ones_ratio ≈ 0.50`, aggregated wire Shannon entropy `7.9922 b/B`)
+  - Atomic `DeliveryAck` commit & `rollback_outbound` recovery on network drop
+  - TMR repair (`64` injected bit flips -> `64` repaired bits, `80/80` dual-region corruption repaired; catastrophic 3-copy corruption rejected cleanly)
+  - Hardware enclave lock blocking cloned sessions + `3-Cube` recovery onto new hardware revoking old hardware
+  - Replay & monotonic tick rollback rejection
+  - 1-to-1 collision-free bijective epoch hopping (`500` coords & `250` nibbles verified round-trip, $O(W \cdot K)$ spiral search in `8` steps)
+  - Zero-oracle DTE Honey Deception (checksum-valid 12-word decoy mnemonic with **0 state mutation**, including **0 monotonic tick bump**)
+  - Full-duplex concurrent bidirectional messaging (`DuplexCubeSession`)
+  - Per-message & per-epoch X25519 DH Ratchet forward/post-compromise security
+  - C ABI shared/static library verification (`cubehash.h` lifecycle + zero-oracle test)
+- **Measured `cubehash-cli --release` Speed & Constant-Time Uniformity:**
+  - `Blake2b`: `9.09 µs/op` | `Sha3_256`: `8.60 µs/op` | `HmacSha256`: `8.62 µs/op` | `HybridTriMix`: `8.87 µs/op`
+  - **Full 100-cube E2E roundtrip** (`512 B` AEAD send + TMR + receive + ACK commit): **`0.566 ms/msg`**
+
+---
+
+## 6. Quick Commands
+
 ```sh
-cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 cargo run --release -p cubehash-cli
 cargo build --release -p cubehash-ffi
-```
-
-Start a headless blind TLS relay (`wss://`):
-```sh
-cargo run -p cubehash-chat -- relay --listen 127.0.0.1:9000
-```
-
-Connect two headless CLI chat clients using the printed `--tls-pin`:
-```sh
-cargo run -p cubehash-chat -- client --id alice --relay wss://127.0.0.1:9000/ws --tls-pin <sha256_hex>
-cargo run -p cubehash-chat -- client --id bob   --relay wss://127.0.0.1:9000/ws --tls-pin <sha256_hex>
 ```
