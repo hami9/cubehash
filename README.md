@@ -21,7 +21,8 @@
 Further deep dives:
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — Module anatomy, state machine, rollback atomicity, and C ABI surface
 - [docs/MATHEMATICS.md](docs/MATHEMATICS.md) — Formal mathematical specification, proofs of invertibility, and exact key schedule
-- [docs/VERIFICATION.md](docs/VERIFICATION.md) — Complete test matrix (`15` integration tests) and verified release benchmark output
+- [docs/SECURITY_PROOFS.md](docs/SECURITY_PROOFS.md) — Cryptographic reductions ("not weaker than standard AEAD/Hash"), `HybridTriMix` combiner theorem, Welch's $|t|$ system timing audit & benchmarks
+- [docs/VERIFICATION.md](docs/VERIFICATION.md) — Complete test matrix (`18` integration tests) and verified `10`-stage release audit output
 - [CHANGELOG.md](CHANGELOG.md) — Release history (`v1.0.1`)
 - [SECURITY.md](SECURITY.md) — Vulnerability disclosure policy & cryptographic scope
 - [CONTRIBUTING.md](CONTRIBUTING.md) — Pull request rules, CI requirements & contribution workflow
@@ -167,25 +168,21 @@ x_2 \equiv x_1 + F_1(y_1, z_1) \pmod D, \qquad y_2 \equiv y_1 + F_2(x_2, z_1) \p
 
 ## 5. Security Tests & Live Audit Benchmarks
 
-Verified across **`cubehash-core` (`14/14` security tests)**, **`cubehash-ffi` (`1/1` C-ABI test)**, and **`cubehash-cli` (`7` audit & benchmark stages)** — see [docs/VERIFICATION.md](docs/VERIFICATION.md) for every test and measurement:
+Verified across **`cubehash-core` (`17/17` security & statistical tests)**, **`cubehash-ffi` (`1/1` C-ABI test)**, and **`cubehash-cli` (`10` audit, timing & comparative benchmark stages)** — see [docs/SECURITY_PROOFS.md](docs/SECURITY_PROOFS.md) and [docs/VERIFICATION.md](docs/VERIFICATION.md):
 
-- **Zero compiler/lint warnings:** `cargo clippy --workspace --all-targets -- -D warnings`
-- **All tests passing (`15/15`):**
-  - Resizable profile validation (`compact`, `standard`, `high_capacity`)
-  - Dual payload mode (`RawCore256` <= `24 B` + `ArbitraryCiphertext` `XChaCha20-Poly1305`)
-  - `120`-message cellular lifecycle rotation (`~18,100 B` RAM, `ones_ratio ≈ 0.50`, aggregated wire Shannon entropy `7.9922 b/B`)
+- **Zero compiler/lint warnings:** `cargo clippy --workspace --all-targets -- -D warnings` & `cargo fmt --all -- --check`
+- **All tests passing (`18/18`):**
+  - Resizable profile validation (`compact`, `standard`, `high_capacity`) & dual payload mode (`RawCore256` <= `24 B` + `ArbitraryCiphertext` `XChaCha20-Poly1305`)
+  - `120`-message cellular lifecycle rotation (`~18,100 B` RAM, `ones_ratio ≈ 0.50`, aggregated wire Shannon entropy `7.9919 b/B`)
   - Atomic `DeliveryAck` commit & `rollback_outbound` recovery on network drop
-  - TMR repair (`64` injected bit flips -> `64` repaired bits, `80/80` dual-region corruption repaired; catastrophic 3-copy corruption rejected cleanly)
-  - Hardware enclave lock blocking cloned sessions + `3-Cube` recovery onto new hardware revoking old hardware
-  - Replay & monotonic tick rollback rejection
-  - 1-to-1 collision-free bijective epoch hopping (`500` coords & `250` nibbles verified round-trip, $O(W \cdot K)$ spiral search in `8` steps)
-  - Zero-oracle DTE Honey Deception (checksum-valid 12-word decoy mnemonic with **0 state mutation**, including **0 monotonic tick bump**)
-  - Full-duplex concurrent bidirectional messaging (`DuplexCubeSession`)
-  - Per-message & per-epoch X25519 DH Ratchet forward/post-compromise security
-  - C ABI shared/static library verification (`cubehash.h` lifecycle + zero-oracle test)
-- **Measured `cubehash-cli --release` Speed & Constant-Time Uniformity:**
-  - `Blake2b`: `9.09 µs/op` | `Sha3_256`: `8.60 µs/op` | `HmacSha256`: `8.62 µs/op` | `HybridTriMix`: `8.87 µs/op`
-  - **Full 100-cube E2E roundtrip** (`512 B` AEAD send + TMR + receive + ACK commit): **`0.566 ms/msg`**
+  - TMR repair (`64` / `80` bit-flip repair + rejection of catastrophic 3-copy corruption)
+  - Hardware enclave lock blocking cloned sessions + `3-Cube` recovery onto new hardware
+  - Replay & monotonic tick rollback rejection + collision-free bijective epoch hopping (`500` coords & `250` nibbles)
+  - Zero-oracle DTE Honey Deception (`ReceiveOutcome::Authentic` vs `HoneyDeception`, **0** state/tick mutation on probe)
+  - **Cryptographic Strength & Timing Proofs:** Strict Avalanche (`50.36%`), `64 KiB` Shannon entropy (`7.99724 b/B`), Pearson $\chi^2 = 250.67$ matching `XChaCha20-Poly1305` (`255.19`) / `SHA-256` (`293.05`), and system-level `decrypt_zero_oracle` Welch $|t| \le 1.00$ (`ratio = 0.988x–0.991x`) across tampered-MAC, wrong-hardware, bad-sequence, and bad-dimension probes!
+- **Measured `cubehash-cli --release` Speed:**
+  - Constant tri-leg mix: `Blake2b`: `8.75 µs` | `Sha3_256`: `8.90 µs` | `HmacSha256`: `8.89 µs` | `HybridTriMix`: `8.67 µs`
+  - **Full 100-cube E2E roundtrip:** **`0.581 ms/msg`** (`512 B`) and **`1.041 ms/msg` / `60.1 MB/s`** (`64 KiB`) vs standalone `XChaCha20-Poly1305` (`563.9 MB/s`).
 
 ---
 

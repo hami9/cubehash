@@ -25,6 +25,9 @@ pub use mesh::{
     build_custody_bundle, CellularMesh, DeliveryAck, DuplexCubeSession, EphemeralCubeAlgorithm,
     MeshAuditStats, PayloadMode, ReceiveOutcome, UniqueWireCube, WirePacket,
 };
-pub use primitives::{ones_ratio, shannon_entropy_bits_per_byte, CombiningFn, TimeAlgorithm};
+pub use primitives::{
+    lag1_bit_autocorrelation, ones_ratio, pearson_chi_square_uniform,
+    shannon_entropy_bits_per_byte, CombiningFn, TimeAlgorithm,
+};
 pub use spiral::{Coord3D, SpiralSpace};
 pub use voxel::{HealReport, SubCube, VoxelCube};

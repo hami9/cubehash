@@ -95,7 +95,11 @@ dependencies = [
 name = "cubehash-cli"
 version = "1.0.1"
 dependencies = [
+ "blake2",
  "cubehash-core",
+ "sha2",
+ "sha3",
+ "x25519-dalek",
 ]
 
 [[package]]

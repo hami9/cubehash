@@ -272,3 +272,45 @@ pub fn shannon_entropy_bits_per_byte(bytes: &[u8]) -> f64 {
     }
     entropy
 }
+
+/// Computes Pearson's chi-squared statistic (`df = 255`) testing byte uniformity (`expected = n / 256`).
+pub fn pearson_chi_square_uniform(bytes: &[u8]) -> f64 {
+    if bytes.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0u64; 256];
+    for &b in bytes {
+        counts[b as usize] += 1;
+    }
+    let expected = bytes.len() as f64 / 256.0;
+    counts
+        .iter()
+        .map(|&obs| {
+            let diff = obs as f64 - expected;
+            (diff * diff) / expected
+        })
+        .sum()
+}
+
+/// Computes empirical lag-1 bit-level serial correlation (`-1.0..=1.0`, ideal uniform `0.0`).
+pub fn lag1_bit_autocorrelation(bytes: &[u8]) -> f64 {
+    let total_bits = bytes.len() * 8;
+    if total_bits < 2 {
+        return 0.0;
+    }
+    let mut same_count = 0usize;
+    let mut prev_bit = bytes[0] & 1;
+    for (idx, &byte) in bytes.iter().enumerate() {
+        let start = if idx == 0 { 1 } else { 0 };
+        for shift in start..8 {
+            let cur = (byte >> shift) & 1;
+            if cur == prev_bit {
+                same_count += 1;
+            }
+            prev_bit = cur;
+        }
+    }
+    let pairs = (total_bits - 1) as f64;
+    let diff_count = (total_bits - 1) - same_count;
+    (same_count as f64 - diff_count as f64) / pairs
+}

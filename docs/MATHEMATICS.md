@@ -2,6 +2,8 @@
 
 This specification documents the exact mathematical constructions, key schedules, algebraic transformations, and bounds implemented in `crates/cubehash-core`.
 
+> For formal security reduction theorems (IND-CPA / INT-CTXT, `HybridTriMix` combiner proofs, and empirical statistical/timing proofs), see **[docs/SECURITY_PROOFS.md](SECURITY_PROOFS.md)**.
+
 ---
 
 ## 1. Notation & Primitives

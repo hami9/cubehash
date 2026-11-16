@@ -621,6 +621,19 @@ impl CellularMesh {
             DteEngine::synthesize_honey_output(&self.config, honey_profile, &probe, &self.decoys);
         probe.zeroize();
 
+        // Execute ACK MAC synthesis unconditionally so invalid probes incur matching HMAC work.
+        let dummy_ack_key = [0u8; 32];
+        let ack_key_ref = match &transition_res {
+            Ok(t) => &t.ack_mac_key,
+            Err(_) => &dummy_ack_key,
+        };
+        let candidate_ack_mac = Self::compute_ack_mac(
+            ack_key_ref,
+            &packet.wire_cube.cube_fingerprint,
+            packet.sequence,
+            &next_dh_pub,
+        );
+
         let outcome = if authentic_mask == 1 {
             if let Ok(transition) = transition_res {
                 let ack = DeliveryAck {
@@ -628,12 +641,7 @@ impl CellularMesh {
                     sequence: packet.sequence,
                     new_generation: packet.sequence,
                     next_ratchet_pub: next_dh_pub,
-                    ack_mac: Self::compute_ack_mac(
-                        &transition.ack_mac_key,
-                        &packet.wire_cube.cube_fingerprint,
-                        packet.sequence,
-                        &next_dh_pub,
-                    ),
+                    ack_mac: candidate_ack_mac,
                 };
                 self.clock_guard.local_monotonic_tick = candidate_tick;
                 self.commit_receive_transition(

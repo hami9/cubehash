@@ -1,11 +1,17 @@
 use std::collections::HashSet;
+use std::time::Instant;
 
+use blake2::{Blake2b512, Digest as Blake2Digest};
+use cubehash_core::primitives::{aead_seal, fixed_budget_mix, hmac_sha256};
 use cubehash_core::{
-    ones_ratio, shannon_entropy_bits_per_byte, CellularMesh, CombiningFn, Coord3D, CubeHashError,
-    DteEngine, DuplexCubeSession, HardwareProvider, HoneyProfile, MeshConfig,
-    OsBoundHardwareProvider, PayloadMode, ReceiveOutcome, SpiralSpace, ThreeCubeCustody,
-    TimeAlgorithm, VirtualHardwareEnclave,
+    lag1_bit_autocorrelation, ones_ratio, pearson_chi_square_uniform,
+    shannon_entropy_bits_per_byte, CellularMesh, CombiningFn, Coord3D, CubeHashError, DteEngine,
+    DuplexCubeSession, HardwareProvider, HoneyProfile, MeshConfig, OsBoundHardwareProvider,
+    PayloadMode, ReceiveOutcome, SpiralSpace, ThreeCubeCustody, TimeAlgorithm,
+    VirtualHardwareEnclave, WirePacket,
 };
+use sha2::Sha256;
+use sha3::Sha3_256;
 
 fn make_custody(config: &MeshConfig) -> ThreeCubeCustody {
     ThreeCubeCustody::generate(
@@ -697,5 +703,232 @@ fn test_zero_oracle_constant_work_never_mutates_on_any_failure() {
             alice.commit_ack(&alice_hw, &ack).unwrap();
         }
         ReceiveOutcome::HoneyDeception { .. } => panic!("authentic packet rejected"),
+    }
+}
+
+fn bit_hamming_distance(a: &[u8], b: &[u8]) -> usize {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x ^ y).count_ones() as usize)
+        .sum()
+}
+
+#[test]
+fn test_avalanche_sac_chi_square_and_baseline_indistinguishability() {
+    // 1. Strict Avalanche Criterion (SAC) on fixed_budget_mix (1-bit input & key flip)
+    let key = [0x5Au8; 32];
+    let mut base_msg = [0x3Cu8; 64];
+    let base_digest = fixed_budget_mix(TimeAlgorithm::HybridTriMix, &key, b"sac", &base_msg, 4);
+
+    let mut total_flips = 0usize;
+    let trials = 200usize;
+    for trial in 0..trials {
+        let bit_pos = trial % (base_msg.len() * 8);
+        base_msg[bit_pos / 8] ^= 1u8 << (bit_pos % 8);
+        let flipped_digest =
+            fixed_budget_mix(TimeAlgorithm::HybridTriMix, &key, b"sac", &base_msg, 4);
+        base_msg[bit_pos / 8] ^= 1u8 << (bit_pos % 8);
+        total_flips += bit_hamming_distance(&base_digest, &flipped_digest);
+    }
+    let mean_sac = total_flips as f64 / (trials as f64 * 256.0);
+    assert!(
+        (0.45..=0.55).contains(&mean_sac),
+        "SAC mean flip ratio outside 0.45..=0.55: {mean_sac:.4}"
+    );
+
+    // 2. Compare 64 KiB statistical uniformity of CubeHash ciphertext stream vs SHA-256 & XChaCha20-Poly1305
+    let cfg = MeshConfig::standard();
+    let custody = make_custody(&cfg);
+    let alice_hw = VirtualHardwareEnclave::random().unwrap();
+    let bob_hw = VirtualHardwareEnclave::random().unwrap();
+    let (mut alice, mut bob) = CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
+
+    // Repetitive predictable plaintext (all zeroes + sequential tag) must produce uniform wire ciphertext
+    let mut cubehash_stream = Vec::with_capacity(68 * 1024);
+    let plain_block = vec![0u8; 1024];
+    while cubehash_stream.len() < 65_536 {
+        let mut pkt = alice.begin_send_message(&alice_hw, &plain_block).unwrap();
+        cubehash_stream.extend_from_slice(&pkt.wire_cube.partial_256b);
+        cubehash_stream.extend_from_slice(&pkt.packet_mac);
+        if let PayloadMode::ArbitraryCiphertext { ref ciphertext } = pkt.payload_mode {
+            cubehash_stream.extend_from_slice(ciphertext);
+        }
+        let (_, ack, _) = bob.receive_authenticated(&bob_hw, &mut pkt).unwrap();
+        alice.commit_ack(&alice_hw, &ack).unwrap();
+    }
+    cubehash_stream.truncate(65_536);
+
+    let mut std_aead_stream = Vec::with_capacity(68 * 1024);
+    let std_key = [0x42u8; 32];
+    let mut counter = 0u64;
+    while std_aead_stream.len() < 65_536 {
+        let mut nonce = [0u8; 24];
+        nonce[..8].copy_from_slice(&counter.to_le_bytes());
+        let ct = aead_seal(&std_key, &nonce, b"baseline", &plain_block).unwrap();
+        std_aead_stream.extend_from_slice(&ct);
+        counter += 1;
+    }
+    std_aead_stream.truncate(65_536);
+
+    let mut sha2_stream = Vec::with_capacity(65_536);
+    for blk in 0..2048u64 {
+        let digest = Sha256::digest(blk.to_le_bytes());
+        sha2_stream.extend_from_slice(&digest);
+    }
+
+    for (label, sample) in [
+        ("CubeHash-64KiB", cubehash_stream.as_slice()),
+        ("XChaCha20-Poly1305-64KiB", std_aead_stream.as_slice()),
+        ("SHA-256-64KiB", sha2_stream.as_slice()),
+    ] {
+        let ratio = ones_ratio(sample);
+        let entropy = shannon_entropy_bits_per_byte(sample);
+        let chi2 = pearson_chi_square_uniform(sample);
+        let ac = lag1_bit_autocorrelation(sample);
+        assert!(
+            (0.49..=0.51).contains(&ratio),
+            "{label} bit ratio out of bounds: {ratio:.5}"
+        );
+        assert!(
+            entropy > 7.99,
+            "{label} Shannon entropy below 7.99 b/B: {entropy:.5}"
+        );
+        assert!(
+            chi2 < 330.5,
+            "{label} chi-square exceeded p=0.001 critical bound (330.5): {chi2:.2}"
+        );
+        assert!(
+            ac.abs() < 0.02,
+            "{label} lag-1 bit autocorrelation too high: {ac:.5}"
+        );
+    }
+}
+
+#[test]
+fn test_hybrid_trimix_combiner_strength_and_non_degeneracy() {
+    let key = [0xA5u8; 32];
+    let input = [0u8; 128];
+
+    let h_blake = fixed_budget_mix(TimeAlgorithm::Blake2b, &key, b"dom", &input, 4);
+    let h_sha3 = fixed_budget_mix(TimeAlgorithm::Sha3_256, &key, b"dom", &input, 4);
+    let h_hmac = fixed_budget_mix(TimeAlgorithm::HmacSha256, &key, b"dom", &input, 4);
+    let h_hybrid = fixed_budget_mix(TimeAlgorithm::HybridTriMix, &key, b"dom", &input, 4);
+
+    // Exact algebraic identity: HybridTriMix_i = BLAKE_i ^ rotl(SHA3_i, 3) ^ rotr(HMAC_i, 5)
+    for i in 0..32 {
+        assert_eq!(
+            h_hybrid[i],
+            h_blake[i] ^ h_sha3[i].rotate_left(3) ^ h_hmac[i].rotate_right(5)
+        );
+    }
+
+    // Domain separation & non-degeneracy against standalone standard SHA3-256 / BLAKE2b / HMAC
+    let mut b2 = Blake2b512::new();
+    b2.update(input);
+    let b2_raw = &b2.finalize()[..32];
+    let s3_raw = Sha3_256::digest(input);
+    let hm_raw = hmac_sha256(&key, &input);
+    assert_ne!(h_hybrid.as_slice(), b2_raw);
+    assert_ne!(h_hybrid.as_slice(), s3_raw.as_slice());
+    assert_ne!(h_hybrid.as_slice(), &hm_raw);
+
+    // 1-bit flip in domain & key produces ~50% Hamming transition
+    let h_dom2 = fixed_budget_mix(TimeAlgorithm::HybridTriMix, &key, b"don", &input, 4);
+    let mut key2 = key;
+    key2[0] ^= 0x01;
+    let h_key2 = fixed_budget_mix(TimeAlgorithm::HybridTriMix, &key2, b"dom", &input, 4);
+
+    let dom_flip = bit_hamming_distance(&h_hybrid, &h_dom2) as f64 / 256.0;
+    let key_flip = bit_hamming_distance(&h_hybrid, &h_key2) as f64 / 256.0;
+    assert!((0.35..=0.65).contains(&dom_flip), "dom_flip={dom_flip:.3}");
+    assert!((0.35..=0.65).contains(&key_flip), "key_flip={key_flip:.3}");
+}
+
+#[test]
+fn test_system_level_decrypt_zero_oracle_timing_consistency() {
+    let cfg = MeshConfig::standard();
+    let custody = make_custody(&cfg);
+    let alice_hw = VirtualHardwareEnclave::random().unwrap();
+    let bob_hw = VirtualHardwareEnclave::random().unwrap();
+    let wrong_hw = VirtualHardwareEnclave::random().unwrap();
+
+    let samples = 64usize;
+    let mut auth_pairs: Vec<(CellularMesh, WirePacket)> = Vec::with_capacity(samples);
+    for i in 0..samples {
+        let (mut a, b) =
+            CellularMesh::new_paired(cfg.clone(), custody.clone(), &alice_hw, &bob_hw).unwrap();
+        let pkt = a
+            .begin_send_message(&alice_hw, format!("timing-sample-{i:04}").as_bytes())
+            .unwrap();
+        auth_pairs.push((b, pkt));
+    }
+    let (_, mut bob_probe) = CellularMesh::new_paired(cfg, custody, &alice_hw, &bob_hw).unwrap();
+
+    let probe_template = auth_pairs[0].1.clone();
+    let mut bad_mac_pkt = probe_template.clone();
+    bad_mac_pkt.packet_mac[0] ^= 0xFF;
+    let mut bad_seq_pkt = probe_template.clone();
+    bad_seq_pkt.sequence = 999;
+    let mut bad_dim_pkt = probe_template.clone();
+    bad_dim_pkt.wire_cube.partial_256b.truncate(4);
+
+    // Warmup CPU & caches
+    for _ in 0..8 {
+        let _ = bob_probe.decrypt_zero_oracle(&bob_hw, &bad_mac_pkt, HoneyProfile::ChatPlaintext);
+    }
+
+    let mut t_auth = Vec::with_capacity(samples);
+    let mut t_bad_mac = Vec::with_capacity(samples);
+    let mut t_wrong_hw = Vec::with_capacity(samples);
+    let mut t_bad_seq = Vec::with_capacity(samples);
+    let mut t_bad_dim = Vec::with_capacity(samples);
+
+    for (mut bob_i, pkt) in auth_pairs {
+        let s0 = Instant::now();
+        let out_a = bob_i.decrypt_zero_oracle(&bob_hw, &pkt, HoneyProfile::ChatPlaintext);
+        t_auth.push(s0.elapsed().as_nanos() as u64);
+        assert!(matches!(out_a, ReceiveOutcome::Authentic { .. }));
+
+        let s1 = Instant::now();
+        let out_m =
+            bob_probe.decrypt_zero_oracle(&bob_hw, &bad_mac_pkt, HoneyProfile::ChatPlaintext);
+        t_bad_mac.push(s1.elapsed().as_nanos() as u64);
+        assert!(matches!(out_m, ReceiveOutcome::HoneyDeception { .. }));
+
+        let s2 = Instant::now();
+        let out_h =
+            bob_probe.decrypt_zero_oracle(&wrong_hw, &probe_template, HoneyProfile::ChatPlaintext);
+        t_wrong_hw.push(s2.elapsed().as_nanos() as u64);
+        assert!(matches!(out_h, ReceiveOutcome::HoneyDeception { .. }));
+
+        let s3 = Instant::now();
+        let out_s =
+            bob_probe.decrypt_zero_oracle(&bob_hw, &bad_seq_pkt, HoneyProfile::ChatPlaintext);
+        t_bad_seq.push(s3.elapsed().as_nanos() as u64);
+        assert!(matches!(out_s, ReceiveOutcome::HoneyDeception { .. }));
+
+        let s4 = Instant::now();
+        let out_d =
+            bob_probe.decrypt_zero_oracle(&bob_hw, &bad_dim_pkt, HoneyProfile::ChatPlaintext);
+        t_bad_dim.push(s4.elapsed().as_nanos() as u64);
+        assert!(matches!(out_d, ReceiveOutcome::HoneyDeception { .. }));
+    }
+
+    let median = |v: &mut Vec<u64>| -> f64 {
+        v.sort_unstable();
+        v[v.len() / 2] as f64
+    };
+    let m_auth = median(&mut t_auth).max(1.0);
+    for (label, mut vec) in [
+        ("bad_mac", t_bad_mac),
+        ("wrong_hw", t_wrong_hw),
+        ("bad_seq", t_bad_seq),
+        ("bad_dim", t_bad_dim),
+    ] {
+        let ratio = median(&mut vec) / m_auth;
+        assert!(
+            (0.25..=2.5).contains(&ratio),
+            "system-level timing discrepancy on {label}: ratio={ratio:.2} vs authentic"
+        );
     }
 }
